@@ -28,6 +28,9 @@
 #include "web_server.h"
 #include "serial_cli.h"
 
+/* How long to wait for the HaLow link before starting the management AP. */
+#define HALOW_LINK_WAIT_MS 45000
+
 static bool s_serversStarted = false;
 
 void setup() {
@@ -51,14 +54,20 @@ void setup() {
   LOGI("BOOT", "role: HaLow %s", roleName(g_cfg.role));
 
   /*
-   * HaLow first, matching the order the Heltec NAPT examples use, but without
-   * blocking on association: the management AP and panel must come up even if
-   * the HaLow link never establishes, otherwise the tester is unusable in the
-   * field exactly when you need it most.
+   * Order matters, and it is not negotiable: the HaLow link must be up before
+   * the ESP32's 2.4 GHz Wi-Fi is started. Every Heltec example blocks on
+   * HaLow.status() != WL_CONNECTED and only then calls WiFi.begin() /
+   * WiFi.softAP(). Starting the 2.4 GHz radio while the MM6108 is still
+   * scanning prevents the STA from ever finding the AP.
+   *
+   * The timeout keeps the tester usable in the field: if the link never comes
+   * up, the panel still appears so you can diagnose it from a phone.
    */
   halowInit();
   if (!halowStart()) {
     LOGE("BOOT", "HaLow start failed - panel will still be available");
+  } else {
+    halowWaitForLink(HALOW_LINK_WAIT_MS);
   }
 
   webInit();

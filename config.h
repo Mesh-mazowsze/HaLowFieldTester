@@ -43,6 +43,16 @@ struct AppConfig {
   uint8_t  channel;         /* S1G channel number (EU 1 MHz: 1,3,5,7,9) */
   uint16_t txPowerDbm;      /* 0 = no override, use regulatory maximum */
 
+  /*
+   * AP beacon interval in TU (1 TU = 1.024 ms). 0 = pick automatically.
+   *
+   * This matters enormously in the EU. At 1 MHz a beacon takes ~4-5 ms, so at
+   * the 100 TU default it needs ~4-5% airtime - above the EU 2.80% duty cycle
+   * limit. The driver then suppresses beacons and no station can ever find the
+   * AP. Stretching the interval brings it back under the limit.
+   */
+  uint16_t beaconIntervalTus;
+
   /* --- HaLow IP (no DHCP server on the HaLow AP, so both ends are static) --- */
   uint32_t ip;
   uint32_t netmask;

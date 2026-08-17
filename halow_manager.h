@@ -43,6 +43,19 @@ void        halowInit(void);          /* set up event hooks, power the module */
 bool        halowStart(void);         /* apply config and start AP or STA */
 void        halowTick(void);          /* housekeeping, called from loop() */
 
+/*
+ * Blocks until the HaLow link is up, or the timeout expires.
+ *
+ * This must complete before the ESP32's own 2.4 GHz Wi-Fi is started: every
+ * Heltec example (HalowClient.ino, NAPT_HalowSTA_STATIC_to_WiFiAP.ino, ...)
+ * spins on HaLow.status() != WL_CONNECTED and only then calls WiFi.begin() /
+ * WiFi.softAP(). Bringing the 2.4 GHz radio up while the MM6108 is still
+ * scanning stops the STA from ever finding the AP.
+ *
+ * Returns true if the link came up within the timeout.
+ */
+bool        halowWaitForLink(uint32_t timeoutMs);
+
 bool        halowIsUp(void);          /* link established (AP running / STA associated) */
 uint32_t    halowLinkUptimeMs(void);  /* 0 when down */
 uint32_t    halowDisconnectCount(void);

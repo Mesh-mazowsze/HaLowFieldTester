@@ -417,6 +417,7 @@ static void hConfigGet(void) {
   jsStr(j, "region", g_cfg.region);
   jsNum(j, "channel", g_cfg.channel);
   jsNum(j, "txpower", g_cfg.txPowerDbm);
+  jsNum(j, "beacon_tus", g_cfg.beaconIntervalTus);
   jsStr(j, "ip", IPAddress(g_cfg.ip).toString());
   jsStr(j, "netmask", IPAddress(g_cfg.netmask).toString());
   jsStr(j, "gateway", IPAddress(g_cfg.gateway).toString());
@@ -490,6 +491,11 @@ static void hConfigPost(void) {
     long p = s_http.arg("txpower").toInt();
     if (p < 0 || p > 30) err = "TX power must be 0..30 dBm";
     else g_cfg.txPowerDbm = (uint16_t)p;
+  }
+  if (s_http.hasArg("beacon_tus")) {
+    long b = s_http.arg("beacon_tus").toInt();
+    if (b != 0 && (b < 50 || b > 10000)) err = "beacon interval must be 0 (auto) or 50..10000 TU";
+    else g_cfg.beaconIntervalTus = (uint16_t)b;
   }
 
   if (!argIp("ip", g_cfg.ip))           err = "invalid IP address";

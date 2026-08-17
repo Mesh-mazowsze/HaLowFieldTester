@@ -12,6 +12,7 @@ static bool      s_linkUp        = false;
 static uint32_t  s_linkUpSince   = 0;
 static uint32_t  s_disconnects   = 0;
 static bool      s_started       = false;
+static bool      s_apEnabled     = false;
 
 /* ------------------------------------------------------------------ */
 /* Regulatory database access                                          */
@@ -79,17 +80,24 @@ bool halowChannelByNumber(const char *region, uint8_t chanNum, ChannelInfo &out)
 }
 
 bool halowCurrentChannel(ChannelInfo &out) {
-  uint8_t ch = 0;
+  /*
+   * We program the AP channel ourselves (see startApDirect), and the STA joins
+   * on the configured channel's regulatory entry, so the configured channel is
+   * authoritative in both roles.
+   */
+  return halowChannelByNumber(g_cfg.region, g_cfg.channel, out);
+}
 
+/*
+ * AP role: the Heltec wrapper's status is not used because we enable the AP
+ * through the Morse API directly, so ask the driver instead.
+ */
+static bool linkIsUp(void) {
   if (g_cfg.role == ROLE_AP) {
-    /* AP mode: the wrapper keeps the channel it was started on. */
-    ch = (uint8_t)HaLow.HalowAPClass::getChannel();
+    uint8_t bssid[6];
+    return s_apEnabled && (mmwlan_ap_get_bssid(bssid) == MMWLAN_SUCCESS);
   }
-  if (ch == 0) {
-    /* STA mode (or AP not yet up): fall back to the configured channel. */
-    ch = g_cfg.channel;
-  }
-  return halowChannelByNumber(g_cfg.region, ch, out);
+  return HaLow.status() == WL_CONNECTED;
 }
 
 /* ------------------------------------------------------------------ */
@@ -204,6 +212,84 @@ void halowInit(void) {
   HaLow.onEvent(onHalowEvent);
 }
 
+/*
+ * Choose a beacon interval that keeps beaconing inside the channel's duty
+ * cycle allowance.
+ *
+ * A beacon is sent at the lowest MCS. Rough airtime at MCS0, long GI:
+ *   1 MHz -> 300 kbps  -> ~4-5 ms for a typical S1G beacon
+ *   2 MHz -> 650 kbps  -> ~2 ms
+ * The EU allows 2.80%. At the 100 TU (102.4 ms) default that puts 1 MHz
+ * beaconing at ~4-5% - over the limit - so the driver stops sending them and
+ * no STA can ever discover the AP. This is why Heltec's own AP example cannot
+ * be joined on any EU 1 MHz channel, while 2 MHz works immediately.
+ *
+ * Verified on hardware: EU ch5 (1 MHz) never associates at 100 TU, and
+ * associates in ~3 s at 300 TU.
+ */
+static uint16_t chooseBeaconInterval(const ChannelInfo &ci) {
+  if (g_cfg.beaconIntervalTus > 0) {
+    return g_cfg.beaconIntervalTus;   /* explicit override */
+  }
+  /* Unrestricted duty cycle (e.g. 100.00%): the default is fine. */
+  if (ci.dutyCyclePct100 >= 10000) {
+    return 100;
+  }
+  /* Duty-cycle limited. Narrow channels need a proportionally longer gap. */
+  return (ci.bwMhz <= 1) ? 300 : 200;
+}
+
+static bool startApDirect(const ChannelInfo &ci,
+                          enum mmwlan_security_type security,
+                          const char *passphrase) {
+  /*
+   * Deliberately not using HaLow.AP(): that wrapper hardcodes
+   * beacon_interval_tus = 0 (-> 100 TU default) and pri_bw_mhz = 0, which
+   * cannot be configured through its API. We build the arguments ourselves and
+   * call the Morse API directly so the beacon interval and primary bandwidth
+   * are set explicitly.
+   */
+  const uint16_t beaconTus = chooseBeaconInterval(ci);
+
+  halow_mode = MMWLAN_VIF_AP;
+
+  struct mmwlan_ap_args args = MMWLAN_AP_ARGS_INIT;
+  strncpy((char *)args.ssid, g_cfg.halowSsid, sizeof(args.ssid) - 1);
+  args.ssid_len = strlen((const char *)args.ssid);
+  strncpy(args.passphrase, passphrase, sizeof(args.passphrase) - 1);
+  args.passphrase_len = strlen(args.passphrase);
+
+  args.security_type       = security;
+  args.pmf_mode            = MMWLAN_PMF_REQUIRED;
+  args.op_class            = (uint16_t)ci.globalOpClass;
+  args.s1g_chan_num        = ci.chanNum;
+  args.pri_bw_mhz          = ci.bwMhz;   /* explicit, not "auto" */
+  args.pri_1mhz_chan_idx   = 0;
+  args.beacon_interval_tus = beaconTus;
+  args.dtim_period         = 1;
+  args.max_stas            = 4;
+
+  mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
+
+  enum mmwlan_status st = mmwlan_ap_enable(&args);
+  if (st != MMWLAN_SUCCESS) {
+    LOGE("HALOW", "mmwlan_ap_enable() failed with status %d", (int)st);
+    return false;
+  }
+
+  LOGI("HALOW", "AP up: op class %u, primary BW %u MHz, beacon %u TU (%lu ms)%s",
+       args.op_class, args.pri_bw_mhz, beaconTus,
+       (unsigned long)((beaconTus * 1024UL) / 1000UL),
+       g_cfg.beaconIntervalTus ? " [manual]" : " [auto]");
+  if (ci.dutyCyclePct100 < 10000 && ci.bwMhz <= 1) {
+    LOGI("HALOW", "beacon interval stretched to stay within the %u.%02u%% duty "
+                  "cycle limit for this channel",
+         ci.dutyCyclePct100 / 100, ci.dutyCyclePct100 % 100);
+  }
+  s_apEnabled = true;
+  return true;
+}
+
 bool halowStart(void) {
   if (s_started) {
     LOGW("HALOW", "already started");
@@ -257,22 +343,61 @@ bool halowStart(void) {
 
   const bool open = (g_cfg.security == SEC_OPEN) || (g_cfg.halowPass[0] == '\0');
 
+  if (g_cfg.security == SEC_SAE && g_cfg.halowPass[0] == '\0') {
+    LOGW("HALOW", "SAE selected but the passphrase is empty - falling back to OPEN; "
+                  "the peer will not associate unless it is also open");
+  }
+
+  /*
+   * Never pass NULL here. HalowClass::AP() guards against a NULL passphrase,
+   * but HalowSTAClass::begin() feeds it straight into mmosal_safer_strcpy()
+   * with no check (HalowSTA.cpp:147), which dereferences NULL and panics the
+   * device into a boot loop. An empty string selects OPEN on both paths.
+   */
+  const char *pass = open ? "" : g_cfg.halowPass;
+
   if (g_cfg.role == ROLE_AP) {
     LOGI("HALOW", "starting AP \"%s\" (%s) on channel %u",
          g_cfg.halowSsid, open ? "OPEN" : "SAE", g_cfg.channel);
-    if (!HaLow.AP(g_cfg.halowSsid, open ? NULL : g_cfg.halowPass, g_cfg.channel)) {
-      LOGE("HALOW", "HaLow.AP() failed");
+    if (!startApDirect(ci, open ? MMWLAN_OPEN : MMWLAN_SAE, pass)) {
       return false;
     }
   } else {
     LOGI("HALOW", "starting STA, joining \"%s\" (%s)",
          g_cfg.halowSsid, open ? "OPEN" : "SAE");
-    HaLow.begin(g_cfg.halowSsid, open ? NULL : g_cfg.halowPass,
-                open ? MMWLAN_OPEN : MMWLAN_SAE, g_cfg.region);
+    HaLow.begin(g_cfg.halowSsid, pass, open ? MMWLAN_OPEN : MMWLAN_SAE, g_cfg.region);
   }
 
   s_started = true;
   return true;
+}
+
+bool halowWaitForLink(uint32_t timeoutMs) {
+  uint32_t start = millis();
+  uint32_t lastDot = 0;
+
+  LOGI("HALOW", "waiting up to %lu s for the HaLow link before starting the "
+                "2.4 GHz management AP", (unsigned long)(timeoutMs / 1000));
+
+  while ((uint32_t)(millis() - start) < timeoutMs) {
+    halowTick();
+    if (linkIsUp()) {
+      LOGI("HALOW", "link established after %lu ms",
+           (unsigned long)(millis() - start));
+      return true;
+    }
+    if ((uint32_t)(millis() - lastDot) >= 5000) {
+      lastDot = millis();
+      LOGI("HALOW", "  ... still associating (%lu s)",
+           (unsigned long)((millis() - start) / 1000));
+    }
+    delay(200);
+  }
+
+  LOGW("HALOW", "link did not come up within %lu s; starting the management AP "
+                "anyway so the panel stays reachable",
+       (unsigned long)(timeoutMs / 1000));
+  return false;
 }
 
 void halowTick(void) {
@@ -280,7 +405,7 @@ void halowTick(void) {
    * The Arduino event for AP mode never reports GOT_IP the way STA does, so
    * track link state from the wrapper status as well.
    */
-  bool up = (HaLow.status() == WL_CONNECTED);
+  bool up = linkIsUp();
   if (up != s_linkUp) {
     if (up) {
       s_linkUp = true;

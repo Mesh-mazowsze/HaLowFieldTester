@@ -148,17 +148,15 @@ this table at runtime rather than hard‑coding it. Region string is **`"EU"`**.
 Occupied band: 863.0–868.0 MHz. **Default in this firmware: region `EU`,
 channel 5 (865.5 MHz), 1 MHz.** No US/915 MHz default is ever applied.
 
-> ⚠️ **BCF labelling caveat (verified on hardware).** `boards.txt` links
-> `bcf_HC01_V2_L` — the low-band (868 MHz) board configuration — for
-> HT‑RC3268. However, the running device reports its BCF board description as
-> **`HC01_V2_H`**. Inspecting the archives shows that
+> **BCF labelling caveat (cosmetic).** `boards.txt` links `bcf_HC01_V2_L` — the
+> low-band (868 MHz) board configuration — for HT‑RC3268, yet the running
+> device reports its BCF board description as **`HC01_V2_H`**. The archives
 > `libbcf_HC01_V2_L.a` (1064 B) and `libbcf_HC01_V2_H.a` (1042 B) are genuinely
-> different files with different hashes, but **both embed the same
-> `board_desc` string `"HC01_V2_H"`**. So this is a labelling error inside
-> Heltec's low-band BCF, not proof that the wrong BCF is linked. The practical
-> consequence: **the BCF board description cannot be used to verify which band
-> is loaded** — trust `build.bcf_lib` in `boards.txt` instead. Worth raising
-> with Heltec if you need certainty about the RF calibration data.
+> different files, but **both embed the same `board_desc` string**. The module
+> itself is laser-etched **868**, and 868 MHz operation is confirmed working,
+> so this is only a wrong string inside Heltec's low-band BCF — not a wrong
+> BCF. Practical consequence: **do not use the BCF board description to infer
+> the band**; trust `build.bcf_lib` in `boards.txt`.
 
 > **Note on a Heltec fallback.** `HalowClass::AP()` silently falls back to the
 > *last* channel in the region's list if the requested channel is not found —
@@ -169,6 +167,84 @@ channel 5 (865.5 MHz), 1 MHz.** No US/915 MHz default is ever applied.
 > ⚠️ **TX power and channel configuration must comply with local regulations.**
 > The 868 MHz band is duty‑cycle limited. The UI does not hard‑lock the
 > parameters — it is also a lab tool — so lawful operation is your responsibility.
+
+---
+
+## 4a. ⚠️ The EU 1 MHz beacon problem — and the fix
+
+**This is the single most important finding in this project, and it is why
+Heltec's own AP example cannot be joined on any EU 1 MHz channel.**
+
+### Symptom
+
+On any EU 1 MHz channel (1, 3, 5, 7, 9) the AP starts and reports itself
+healthy — `mmwlan_ap_enable()` returns `MMWLAN_SUCCESS`, `mmwlan_ap_get_bssid()`
+returns a valid BSSID — but **no station can ever find it**. A STA scan across
+all EU channels at 2 s dwell returns *0 networks*, forever. On the 2 MHz
+channel (6, 866.0 MHz) the identical setup associates in ~3 seconds.
+
+This reproduces with Heltec's **stock, unmodified** `HalowAP.ino` +
+`HalowClientStaticIP.ino`, so it is not a bug in this firmware.
+
+### Cause
+
+EU 868 MHz is duty-cycle limited to **2.80 %**. A beacon is sent at the lowest
+MCS, so its airtime depends on the channel bandwidth:
+
+| Bandwidth | MCS0 rate | Beacon airtime | Duty at 100 TU default | Fits in 2.80 %? |
+|---|---|---|---|---|
+| **1 MHz** | 300 kbps | ~4–5 ms | **~4–5 %** | ❌ **no** |
+| 2 MHz | 650 kbps | ~2 ms | ~2.2 % | ✅ yes |
+
+At the default beacon interval of `MMWLAN_DEFAULT_AP_BEACON_INTERVAL_TUS`
+(100 TU = 102.4 ms), 1 MHz beaconing alone would exceed the EU duty-cycle
+allowance. The driver therefore suppresses the beacons, and the AP is
+effectively invisible. Confirmed on hardware: an AP left on EU ch5 for 55 s had
+**0 frames transmitted** in its rate-control table.
+
+Heltec's `HalowClass::AP()` always passes `beacon_interval_tus = 0` (→ the
+100 TU default) and gives no way to change it.
+
+### Fix
+
+This firmware does **not** use `HaLow.AP()`. It builds `struct mmwlan_ap_args`
+itself and calls `mmwlan_ap_enable()` directly, so it can set both the beacon
+interval and the primary bandwidth explicitly (`halow_manager.cpp`,
+`startApDirect()`):
+
+```c
+args.pri_bw_mhz          = ci.bwMhz;   /* explicit, not Heltec's 0 = "auto" */
+args.beacon_interval_tus = beaconTus;  /* 300 TU on duty-cycle-limited 1 MHz */
+```
+
+`beaconIntervalTus = 0` (the default) selects automatically:
+
+* duty cycle ≥ 100 % → **100 TU** (the standard default)
+* duty-cycle limited, 1 MHz → **300 TU** (307 ms)
+* duty-cycle limited, wider → **200 TU**
+
+It is overridable from the panel (**Config → AP beacon interval**) and the
+serial console (`beacon <TU>`) for experimentation.
+
+**Result:** EU ch5 / 1 MHz associates in ~3 s and stays up.
+
+### What this means for expected performance
+
+The same 2.80 % limit caps throughput. Measured on EU ch5 / 1 MHz with the two
+nodes on a bench:
+
+```
+PHY rate (MCS7, 1 MHz, SGI):  3.33 Mbps
+TCP throughput:                 88 kbps
+UDP throughput:                 82 kbps   (0.00 % loss)
+RTT:                            28 ms min, high variance
+```
+
+88 kbps ≈ 3 Mbps × 2.80 % — the link is running **at the regulatory ceiling**,
+not underperforming. Expect roughly **80–90 kbps** on EU 868 MHz at 1 MHz, and
+latency in the tens-to-hundreds of ms because transmissions are spread to
+respect the duty cycle. If you need more, EU channel 6 (2 MHz) roughly doubles
+it, at the cost of occupied bandwidth.
 
 ---
 
@@ -287,6 +363,27 @@ SSE runs on its own small socket server; the page falls back to polling
 
 ---
 
+## 7a. Serial console
+
+A line-based console on the USB serial port (115200), as a fallback when you
+cannot reach the panel — and the quickest way to script a two-node bring-up.
+Type `help` for the list.
+
+```
+role ap|sta            region <XX>          chan <n>
+ssid <s>  pass <s>     ip|mask|gw|peer <a>  txpower <dBm>
+beacon <TU>            save  reboot  factory
+status   cfg   chans   state   scan [ms]
+ping on|off [ms]       test tcp|udp tx|rx [s] [kbps]   stop
+```
+
+`state` and `scan` are diagnostics: `state` dumps the raw driver view (AP BSSID,
+`mmwlan_get_sta_state()`, duty cycle), and `scan [dwell_ms]` runs a HaLow scan
+and lists what the radio can actually hear — the fastest way to tell "the AP is
+not transmitting" from "the STA cannot associate".
+
+---
+
 ## 8. REST API
 
 All responses are JSON unless noted. Unavailable values are `null`.
@@ -347,10 +444,29 @@ MM6108 API cannot supply them (§2). They are never fabricated.
 9. **Max 2 concurrent SSE clients**, because `CONFIG_LWIP_MAX_SOCKETS` is 10 on
    this platform and the sockets must be shared with iperf.
 10. **GPS is not implemented** (not required for v1) — see §11.
-11. **Untested on hardware.** This builds and links cleanly against the real
-    SDK, and every API call was checked against the actual headers and verified
-    to resolve to a real symbol, but I had no HT‑RC3268 attached. Expect to need
-    a bring‑up pass; the Logs tab and Serial output are the place to start.
+11. **Throughput is duty-cycle bound on EU 1 MHz** — expect ~80–90 kbps, not
+    the 3 Mbps PHY rate. See §4a.
+12. **Two library landmines this firmware works around** (both hit on real
+    hardware; worth knowing if you write your own sketch):
+    * `HalowSTAClass::begin()` feeds the passphrase straight into
+      `mmosal_safer_strcpy()` with **no NULL check** (`HalowSTA.cpp:147`), so
+      `HaLow.begin(ssid, NULL, …)` for an open network dereferences NULL and
+      puts the device into a **panic boot loop**. `HaLow.AP()` guards against
+      this; `begin()` does not. Always pass `""`, never `NULL`.
+    * The ESP32's 2.4 GHz Wi-Fi must not be started until the HaLow link is up.
+      Every Heltec example blocks on `HaLow.status() != WL_CONNECTED` before
+      calling `WiFi.softAP()` / `WiFi.begin()`. This firmware does the same,
+      with a 45 s timeout so the panel still appears if the link never comes up.
+
+### Verified on hardware
+
+Two HT‑RC3268 boards, EU / 868 MHz / channel 5 / **1 MHz**, SAE:
+
+* Same image on both; roles set from NVS and persisted across reboots
+* Association in ~5 s; `MM6108A2`, MM firmware `1.17.6`, BCF `v12.1.0` read live
+* Live RSSI, and **MCS7 / 1 MHz / SGI → 3.33 Mbps** decoded from the rate table
+* RTT via UDP echo (28 ms min), 0 % probe loss, peer telemetry live in both directions
+* TCP 88 kbps / UDP 82 kbps with 0.00 % datagram loss; iperf servers on both ends
 
 ---
 
@@ -359,7 +475,10 @@ MM6108 API cannot supply them (§2). They are never fabricated.
 | Symptom | Check |
 |---|---|
 | No `HaLow-Tester-XXXX` SSID | Serial @115200. Panel starts even if HaLow fails, so a missing SSID means an early boot fault. |
-| Panel loads, **LINK DOWN** forever | Both nodes on the same region *and* channel? Same SSID/passphrase? One AP and one STA, not two of the same? |
+| **LINK DOWN** forever on an EU 1 MHz channel, STA `scan` finds 0 networks | The duty-cycle/beacon problem — see §4a. Check the AP boot log for the `beacon NNN TU` line; on EU 1 MHz it must be ~300 TU. If you set a manual `beacon` value that is too short the AP stops beaconing entirely: set `beacon 0` (auto). |
+| **LINK DOWN** forever, other cases | Both nodes on the same region *and* channel? Same SSID/passphrase? One AP and one STA, not two of the same? |
+| Device reboots in a loop right after the `BCF …` log line | A NULL passphrase reached `HaLow.begin()`. Fixed here; in your own sketch pass `""`, never `NULL`. |
+| Very high PHY error rate with both boards on one desk | Receiver overload: at 16 dBm and ~20 cm apart the receiver sees about −2 dBm. Lower `txpower` or separate the boards — it is not a link fault. |
 | Link up, but **Peer node** shows `(no data)` | Peer IP wrong, or the two nodes are on different subnets. Both must be in the same /24. |
 | RSSI shows `—` on the AP node | Expected: RSSI is STA‑side. It appears once peer telemetry is live. |
 | MCS/PHY show `—` | No traffic. Enable the continuous probe. |

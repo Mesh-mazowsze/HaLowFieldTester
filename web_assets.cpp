@@ -179,7 +179,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
         <div><label>Channel</label><select name="channel" id="cfgChannel"></select></div>
         <div><label>Max TX power (dBm, 0 = regulatory max)</label>
           <input type="number" name="txpower" min="0" max="30"></div>
+        <div><label>AP beacon interval (TU, 0 = auto)</label>
+          <input type="number" name="beacon_tus" min="0" max="10000"></div>
       </div>
+      <div class="hint"><strong>Beacon interval matters on EU 1 MHz.</strong> A
+        beacon at 1 MHz needs ~4–5&nbsp;ms of airtime; at the 100&nbsp;TU default
+        that exceeds the EU 2.80&nbsp;% duty cycle, the driver stops sending
+        beacons and no station can find the AP. Auto stretches it to
+        300&nbsp;TU on duty-cycle-limited 1 MHz channels.</div>
       <div class="hint" id="chanHint"></div>
       <div class="hint"><strong>Note:</strong> the Morse API can only lower the
         regulatory maximum for a channel, never raise it.</div>

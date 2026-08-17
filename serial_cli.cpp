@@ -28,6 +28,7 @@ static void printHelp(void) {
     "  ssid <s> / pass <s>        HaLow credentials\r\n"
     "  ip|mask|gw|peer <addr>     HaLow addressing\r\n"
     "  txpower <dBm>              0 = regulatory max\r\n"
+    "  beacon <TU>                AP beacon interval, 0 = auto (EU 1 MHz needs ~300)\r\n"
     "  save                       write config to NVS\r\n"
     "  reboot                     restart\r\n"
     "  factory                    reset config to defaults\r\n"
@@ -47,12 +48,17 @@ static void printCfg(void) {
                   ci.bwMhz, (int)ci.maxTxEirpDbm);
   }
   Serial.printf("ssid      : %s (%s)\r\n", g_cfg.halowSsid, securityName(g_cfg.security));
+  Serial.printf("passphrase: %s (%u chars)\r\n",
+                g_cfg.halowPass[0] ? "set" : "EMPTY -> link will be OPEN",
+                (unsigned)strlen(g_cfg.halowPass));
   Serial.printf("ip        : %s  mask %s  gw %s\r\n",
                 IPAddress(g_cfg.ip).toString().c_str(),
                 IPAddress(g_cfg.netmask).toString().c_str(),
                 IPAddress(g_cfg.gateway).toString().c_str());
   Serial.printf("peer      : %s\r\n", IPAddress(g_cfg.peerIp).toString().c_str());
   Serial.printf("txpower   : %u dBm (0 = regulatory max)\r\n", g_cfg.txPowerDbm);
+  Serial.printf("beacon    : %u TU%s\r\n", g_cfg.beaconIntervalTus,
+                g_cfg.beaconIntervalTus ? "" : " (auto)");
   Serial.printf("mgmt ssid : %s\r\n", cfgMgmtSsid().c_str());
 }
 
@@ -191,6 +197,13 @@ static void execute(char *line) {
     long p = atol(arg);
     if (p < 0 || p > 30) { Serial.println(F("0..30 dBm")); return; }
     g_cfg.txPowerDbm = (uint16_t)p; Serial.println(F("ok")); return;
+  }
+  if (!strcmp(line, "beacon")) {
+    long b = atol(arg);
+    if (b < 0 || b > 10000) { Serial.println(F("0 (auto) or 50..10000 TU")); return; }
+    g_cfg.beaconIntervalTus = (uint16_t)b;
+    Serial.printf("beacon interval = %ld TU%s\r\n", b, b ? "" : " (auto)");
+    return;
   }
   if (!strcmp(line, "save"))    { Serial.println(cfgSave() ? F("saved") : F("save failed")); return; }
   if (!strcmp(line, "factory")) { cfgFactoryReset(); cfgSave(); Serial.println(F("defaults restored")); return; }

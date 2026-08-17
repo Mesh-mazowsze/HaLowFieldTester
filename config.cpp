@@ -46,6 +46,7 @@ void cfgSetDefaults(AppConfig &c) {
   strlcpy(c.region, "EU", sizeof(c.region));
   c.channel    = 5;
   c.txPowerDbm = 0; /* use the regulatory maximum for the channel */
+  c.beaconIntervalTus = 0; /* auto: derived from bandwidth and duty cycle */
 
   c.netmask = ip4(255, 255, 255, 0);
   c.gateway = ip4(192, 168, 50, 1);
