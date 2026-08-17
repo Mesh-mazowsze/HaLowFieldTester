@@ -533,6 +533,78 @@ static void execute(char *line) {
 
   if (!strcmp(line, "pins")) { probePins(); return; }
 
+  /*
+   * Finds the RS-T108 backlight pin.
+   *
+   * The panel has TFT_EN (power, active LOW) and TFT_BL (backlight, active
+   * HIGH). Driving every candidate low satisfies EN whichever pin it turns out
+   * to be, so the panel powers up; then raising one pin at a time lights the
+   * backlight exactly when we hit BL. Watch the screen and note the number.
+   *
+   * Display signals are inputs, so driving them is safe, and the MM6108, USB,
+   * flash and UART pins are excluded from kSafePins.
+   */
+  if (!strcmp(line, "blhunt")) {
+    /*
+     * Only ever drives TWO pins at a time - one candidate for TFT_EN (low) and
+     * one for TFT_BL (high) - so that if a pin turns out to be an output on the
+     * add-on board, at most one line is ever in contention. An earlier version
+     * drove all twenty at once and the board dropped off USB.
+     *
+     * EN almost certainly has an external pull-up, to hold the panel off when
+     * nothing drives it. On this board only GPIO 4 and 6 show one, so those are
+     * tried as EN by default; pass a pin to force a different one.
+     */
+    int forced = atoi(arg);
+    uint8_t enCands[4]; uint8_t nEn = 0;
+    if (forced > 0 && pinIsSafe((uint8_t)forced)) {
+      enCands[nEn++] = (uint8_t)forced;
+    } else {
+      enCands[nEn++] = 4;
+      enCands[nEn++] = 6;
+    }
+
+    for (uint8_t e = 0; e < nEn; e++) {
+      uint8_t en = enCands[e];
+      Serial.printf("\r\n=== assuming TFT_EN = GPIO%u (held LOW) ===\r\n", en);
+      pinMode(en, OUTPUT); digitalWrite(en, LOW);
+      delay(300);
+
+      for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+        uint8_t bl = kSafePins[i];
+        if (bl == en) continue;
+        Serial.printf("  EN=%-2u  BL try GPIO%-2u\r\n", en, bl);
+        Serial.flush();
+        pinMode(bl, OUTPUT); digitalWrite(bl, HIGH);
+        delay(900);
+        digitalWrite(bl, LOW); pinMode(bl, INPUT);
+        delay(120);
+      }
+      pinMode(en, INPUT);
+    }
+    Serial.println(F("\r\ndone - at which EN/BL pair did the screen light up?"));
+    return;
+  }
+
+  /* Holds one pin HIGH and the rest LOW, to confirm a blhunt result. */
+  if (!strcmp(line, "blhold")) {
+    int p = atoi(arg);
+    if (!pinIsSafe((uint8_t)p)) { Serial.println(F("usage: blhold <bl_gpio> [en_gpio]")); return; }
+    /* Drive only the two pins under test, never the whole header. */
+    int en = 4;
+    const char *sp2 = strchr(arg, ' ');
+    if (sp2) en = atoi(sp2 + 1);
+    if (!pinIsSafe((uint8_t)en)) en = 4;
+
+    pinMode((uint8_t)en, OUTPUT); digitalWrite((uint8_t)en, LOW);
+    pinMode((uint8_t)p,  OUTPUT); digitalWrite((uint8_t)p,  HIGH);
+    Serial.printf("EN=GPIO%d held LOW, BL=GPIO%d held HIGH for 30 s\r\n", en, p);
+    delay(30000);
+    pinMode((uint8_t)en, INPUT); pinMode((uint8_t)p, INPUT);
+    Serial.println(F("released"));
+    return;
+  }
+
   if (!strcmp(line, "i2cbb")) {
     int sda = -1, scl = -1;
     if (sscanf(arg, "%d %d", &sda, &scl) != 2 ||
