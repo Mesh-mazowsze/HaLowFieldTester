@@ -412,6 +412,40 @@ SSE runs on its own small socket server; the page falls back to polling
 
 ---
 
+## 7b. Optional RS-T108 display
+
+The Heltec **RS-T108** shield (a **T108 / NV3001B**, 128x220 portrait TFT on
+4-wire SPI at 4 MHz) turns a node into a standalone field meter - signal,
+modulation, latency and loss at a glance, with no phone.
+
+Detection is automatic: at boot the driver bit-bangs the panel's RDDID register
+and only enables the screen if it answers `0x300101`. A board without the
+shield logs `no panel fitted - running headless` and behaves exactly as before,
+so **one firmware image still serves both nodes**.
+
+### Pin mapping (ESP32-S3 RadioCore)
+
+| Signal | GPIO |   | Signal | GPIO |
+|---|---|---|---|---|
+| TFT_SCL | 17 | | TFT_RST | 4 |
+| TFT_SDA | 38 | | TFT_EN (power, active LOW) | 6 |
+| TFT_CS  | 39 | | TFT_BL (backlight, active HIGH) | 5 |
+| TFT_DC  | 16 | | | |
+
+> The widely published RadioCore table is for the **C6** board and must not be
+> used here. Two of its pins collide with the radio on this board: its GPIO 3 is
+> `HALOW_LDO_CTRL` and its GPIO 1 is `CONFIG_MM_BUSY`, so driving them would cut
+> power to the MM6108. The S3 numbers above are confirmed on hardware by the ID
+> read, which needs SCL, SDA, CS, DC, RST and EN all correct at once.
+
+The driver is written from scratch (`display.cpp`) rather than pulling in
+Arduino_GFX, keeping the project dependency-free. The panel must run at
+**rotation 0**; MADCTL `0xA0` renders only a 128x128 corner correctly.
+
+`tft` on the serial console probes the panel and cycles colours.
+
+---
+
 ## 7a. Serial console
 
 A line-based console on the USB serial port (115200), as a fallback when you

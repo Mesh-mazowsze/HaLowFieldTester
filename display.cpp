@@ -288,18 +288,29 @@ void dispText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg,
     if (c < 32 || c > 126) c = '?';
     const uint8_t *g = FONT5X7[c - 32];
 
-    for (uint8_t col = 0; col < 6; col++) {
-      uint8_t bits = (col < 5) ? pgm_read_byte(&g[col]) : 0x00;
-      for (uint8_t row = 0; row < 8; row++) {
-        uint16_t colour = (bits & (1 << row)) ? fg : bg;
-        if (colour == bg && bg == TFT_BLACK && !(bits & (1 << row))) {
-          /* still paint, so text overwrites cleanly */
-        }
-        dispFillRect((int16_t)(x + col * scale), (int16_t)(y + row * scale),
-                     scale, scale, colour);
+    /*
+     * One address window per character, then the glyph is streamed as pixels.
+     * Doing it per font-pixel instead would cost 48 CASET/RASET/RAMWR round
+     * trips per character, which is far too slow to refresh once a second.
+     */
+    const int16_t cw = 6 * scale, ch = 8 * scale;
+    if (x + cw > TFT_W || y + ch > TFT_H) return;
+
+    setWindow(x, y, cw, ch);
+    digitalWrite(TFT_PIN_DC, HIGH);
+    digitalWrite(TFT_PIN_CS, LOW);
+    for (int16_t row = 0; row < ch; row++) {
+      uint8_t fy = (uint8_t)(row / scale);
+      for (int16_t col = 0; col < cw; col++) {
+        uint8_t fx = (uint8_t)(col / scale);
+        uint8_t bits = (fx < 5) ? pgm_read_byte(&g[fx]) : 0x00;
+        uint16_t colour = (bits & (1 << fy)) ? fg : bg;
+        s_spi->transfer((uint8_t)(colour >> 8));
+        s_spi->transfer((uint8_t)colour);
       }
     }
-    x += 6 * scale;
-    if (x > TFT_W) return;
+    digitalWrite(TFT_PIN_CS, HIGH);
+
+    x += cw;
   }
 }

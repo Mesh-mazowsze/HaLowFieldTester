@@ -27,6 +27,7 @@
 #include "throughput_test.h"
 #include "web_server.h"
 #include "serial_cli.h"
+#include "ui_screen.h"
 
 /*
  * How long to wait for the HaLow link before starting the management AP.
@@ -91,6 +92,9 @@ void setup() {
 
   cliInit();
 
+  /* Optional RS-T108 panel; the node runs headless when none is fitted. */
+  uiInit();
+
   LOGI("BOOT", "ready, free heap %lu B", (unsigned long)ESP.getFreeHeap());
 }
 
@@ -102,6 +106,7 @@ void loop() {
   thrTick();
   webTick();
   cliTick();
+  uiTick();
 
   /* iperf servers need the link, so start them once it is up. */
   if (!s_serversStarted && halowIsUp()) {
