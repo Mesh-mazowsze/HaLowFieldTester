@@ -8,6 +8,7 @@
 #include "throughput_test.h"
 
 #include "web_server.h"
+#include "display.h"
 #include "stats.h"
 
 #include <Wire.h>
@@ -533,6 +534,27 @@ static void execute(char *line) {
 
   if (!strcmp(line, "pins")) { probePins(); return; }
 
+  if (!strcmp(line, "tft")) {
+    Serial.println(F("probing the RS-T108 panel on the ESP32-S3 RadioCore mapping"));
+    Serial.printf("SCL=%d SDA=%d CS=%d DC=%d RST=%d EN=%d BL=%d\r\n",
+                  TFT_PIN_SCL, TFT_PIN_SDA, TFT_PIN_CS, TFT_PIN_DC,
+                  TFT_PIN_RST, TFT_PIN_EN, TFT_PIN_BL);
+    if (!dispInit()) { Serial.println(F("panel not detected")); return; }
+    Serial.println(F("cycling colours - watch the screen"));
+    const uint16_t cols[] = { TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_BLACK };
+    const char *names[]   = { "RED", "GREEN", "BLUE", "WHITE", "BLACK" };
+    for (int i = 0; i < 5; i++) {
+      Serial.printf("  fill %s\r\n", names[i]);
+      dispFill(cols[i]);
+      delay(900);
+    }
+    dispFill(TFT_BLACK);
+    dispText(6, 20, "TFT OK", TFT_GREEN, TFT_BLACK, 2);
+    dispText(6, 50, "HaLow tester", TFT_WHITE, TFT_BLACK, 1);
+    Serial.println(F("done"));
+    return;
+  }
+
   /*
    * Finds the RS-T108 backlight pin.
    *
@@ -556,8 +578,12 @@ static void execute(char *line) {
      * tried as EN by default; pass a pin to force a different one.
      */
     int forced = atoi(arg);
-    uint8_t enCands[4]; uint8_t nEn = 0;
-    if (forced > 0 && pinIsSafe((uint8_t)forced)) {
+    uint8_t enCands[SAFE_PIN_COUNT]; uint8_t nEn = 0;
+    if (!strcmp(arg, "all")) {
+      /* Exhaustive: every safe pin as EN against every other as BL. */
+      for (size_t i = 0; i < SAFE_PIN_COUNT; i++) enCands[nEn++] = kSafePins[i];
+      Serial.println(F("exhaustive sweep - this takes several minutes"));
+    } else if (forced > 0 && pinIsSafe((uint8_t)forced)) {
       enCands[nEn++] = (uint8_t)forced;
     } else {
       enCands[nEn++] = 4;
