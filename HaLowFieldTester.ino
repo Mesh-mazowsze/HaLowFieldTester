@@ -1,0 +1,99 @@
+/*
+ * HaLow Field Tester - Heltec HT-RC3268 (ESP32-S3 + HT-HC01 V2 / Morse Micro MM6108)
+ *
+ * One firmware image for both nodes of a two-node 802.11ah field test set.
+ * The role (HaLow AP or HaLow STA) is chosen from the web panel and stored in
+ * NVS, so the same binary is flashed to both boards.
+ *
+ *   phone/laptop --2.4 GHz mgmt Wi-Fi--> node A (HaLow AP)
+ *                                          |  802.11ah, EU 868 MHz, 1 MHz
+ *                                          v
+ *                                        node B (HaLow STA)
+ *
+ * Target: heltec:esp_halow:HT-RC3268
+ * The board links the HC01_V2_L (low band / 868 MHz) BCF, which is the EU part.
+ *
+ * See README.md for which diagnostics the MM6108 can and cannot provide.
+ */
+
+#include <Arduino.h>
+
+#include "config.h"
+#include "logbuf.h"
+#include "halow_manager.h"
+#include "link_monitor.h"
+#include "rtt_test.h"
+#include "peer_link.h"
+#include "throughput_test.h"
+#include "web_server.h"
+#include "serial_cli.h"
+
+static bool s_serversStarted = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  logInit();
+  LOGI("BOOT", "HaLow Field Tester %s starting", FW_VERSION);
+  /*
+   * boards.txt links bcf_HC01_V2_L (the low-band / 868 MHz board config) for
+   * HT-RC3268. Note that the board_desc string embedded in that BCF reads
+   * "HC01_V2_H", which is a labelling error on Heltec's side - the L and H
+   * archives are genuinely different files. So we report what is linked, and
+   * do not claim the band from the BCF metadata.
+   */
+  LOGI("BOOT", "board HT-RC3268, ESP32-S3, HT-HC01 V2, linked BCF: bcf_HC01_V2_L");
+  LOGI("BOOT", "reset reason %d, free heap %lu B",
+       (int)esp_reset_reason(), (unsigned long)ESP.getFreeHeap());
+
+  cfgLoad();
+  LOGI("BOOT", "role: HaLow %s", roleName(g_cfg.role));
+
+  /*
+   * HaLow first, matching the order the Heltec NAPT examples use, but without
+   * blocking on association: the management AP and panel must come up even if
+   * the HaLow link never establishes, otherwise the tester is unusable in the
+   * field exactly when you need it most.
+   */
+  halowInit();
+  if (!halowStart()) {
+    LOGE("BOOT", "HaLow start failed - panel will still be available");
+  }
+
+  webInit();
+
+  /* Sockets after both stacks exist. */
+  rttInit();
+  peerInit();
+  thrInit();
+  thrRegisterPeerHandler();
+
+  linkMonitorInit();
+
+  if (g_cfg.contEnabled) {
+    rttSetProbing(true, g_cfg.contIntervalMs);
+  }
+
+  cliInit();
+
+  LOGI("BOOT", "ready, free heap %lu B", (unsigned long)ESP.getFreeHeap());
+}
+
+void loop() {
+  halowTick();
+  linkMonitorTick();
+  rttTick();
+  peerTick();
+  thrTick();
+  webTick();
+  cliTick();
+
+  /* iperf servers need the link, so start them once it is up. */
+  if (!s_serversStarted && halowIsUp()) {
+    s_serversStarted = true;
+    thrStartServers();
+  }
+
+  delay(2);
+}
