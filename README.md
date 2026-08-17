@@ -442,7 +442,28 @@ The driver is written from scratch (`display.cpp`) rather than pulling in
 Arduino_GFX, keeping the project dependency-free. The panel must run at
 **rotation 0**; MADCTL `0xA0` renders only a 128x128 corner correctly.
 
+### USER button
+
+`btnscan` identified the button on hardware: 20 clean press/release cycles on
+**GPIO 0**, with no other pin reacting. GPIO 0 is the ESP32-S3 strapping pin, so
+it is only ever read at runtime - holding it during power-up still just enters
+the ROM download mode.
+
+| Action | Effect |
+|---|---|
+| **Tap** | next page: Link -> Throughput -> Radio |
+| **Hold (0.7 s)** on Link/Radio | toggle the continuous RTT probe |
+| **Hold (0.7 s)** on Throughput | run a 10 s TCP TX test |
+
+That makes a node with the shield genuinely standalone: walk the route, watch
+RSSI and MCS, and start a throughput test without touching a phone.
+
 `tft` on the serial console probes the panel and cycles colours.
+
+> **Note for anyone extending the console:** once the panel is up, its seven
+> pins belong to the display driver and a live SPI peripheral. `btnscan`
+> originally reconfigured every safe GPIO including those, which hung the board
+> outright - no output at all, not even a crash dump. It now skips them.
 
 ---
 

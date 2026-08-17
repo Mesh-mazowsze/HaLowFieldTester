@@ -11,9 +11,30 @@
 
 #define UI_PERIOD_MS 1000
 
+/*
+ * The USER button, identified on hardware with btnscan: 20 clean press/release
+ * cycles on GPIO 0 and nothing on any other pin.
+ *
+ * GPIO 0 is the ESP32-S3 strapping pin, so it is only ever read at runtime.
+ * Nothing here depends on its level at reset - holding it during power-up still
+ * just enters the ROM download mode, as it should.
+ */
+#define UI_BTN_PIN      0
+#define UI_BTN_DEBOUNCE 30
+#define UI_BTN_LONG_MS  700
+
+enum UiPage : uint8_t { PAGE_LINK = 0, PAGE_TEST, PAGE_INFO, PAGE_COUNT };
+
 static bool     s_ok       = false;
 static uint32_t s_lastDraw = 0;
 static bool     s_layout   = false;
+static uint8_t  s_page     = PAGE_LINK;
+
+static uint8_t  s_btnStable = HIGH;
+static uint8_t  s_btnLast   = HIGH;
+static uint32_t s_btnAt     = 0;
+static uint32_t s_pressedAt = 0;
+static bool     s_longFired = false;
 
 /* Row positions, chosen for the 128x220 portrait panel. */
 #define ROW_TITLE   2
@@ -50,6 +71,7 @@ void uiInit(void) {
     LOGI("UI", "no panel fitted - running headless");
     return;
   }
+  pinMode(UI_BTN_PIN, INPUT_PULLUP);
   dispBacklight(true);
   dispFill(TFT_BLACK);
   dispText(2, 90, "HaLow tester", TFT_CYAN, TFT_BLACK, 1);
@@ -59,8 +81,133 @@ void uiInit(void) {
 
 bool uiPresent(void) { return s_ok; }
 
+static void drawTestPage(void) {
+  const ThroughputResult &X = thrResult();
+  const RttStats &T = rttStats();
+  char buf[32];
+  static const char *state[] = { "idle", "arming", "running", "done", "failed" };
+
+  line(ROW_TITLE, "THROUGHPUT", TFT_CYAN, 2);
+  dispFillRect(0, ROW_TITLE + 18, TFT_W, 1, TFT_GREY);
+
+  snprintf(buf, sizeof(buf), "%s %s", X.udp ? "UDP" : "TCP",
+           X.dir == THR_DIR_TX ? "TX" : "RX");
+  line(ROW_RSSILBL, buf, TFT_GREY, 1);
+  line(ROW_RSSIBIG, state[X.state <= 4 ? X.state : 0],
+       X.state == THR_RUNNING ? TFT_CYAN : TFT_WHITE, 2);
+
+  uint32_t kbps = (X.state == THR_RUNNING && X.curKbps) ? X.curKbps : X.avgKbps;
+  snprintf(buf, sizeof(buf), "%lu kbps", (unsigned long)kbps);
+  line(ROW_RATE, buf, TFT_GREEN, 2);
+
+  dispFillRect(0, ROW_SEP1, TFT_W, 1, TFT_GREY);
+  snprintf(buf, sizeof(buf), "bytes %lu", (unsigned long)X.bytes);
+  line(ROW_RTT, buf, TFT_WHITE, 1);
+  snprintf(buf, sizeof(buf), "time  %lu.%lus",
+           (unsigned long)(X.durationMs / 1000), (unsigned long)((X.durationMs % 1000) / 100));
+  line(ROW_LOSS, buf, TFT_WHITE, 1);
+  if (X.udpStatsValid)
+    snprintf(buf, sizeof(buf), "loss  %u.%02u %%", X.lossPct100 / 100, X.lossPct100 % 100);
+  else
+    snprintf(buf, sizeof(buf), "loss  --");
+  line(ROW_THR, buf, TFT_WHITE, 1);
+
+  dispFillRect(0, ROW_SEP2, TFT_W, 1, TFT_GREY);
+  if (T.valid) snprintf(buf, sizeof(buf), "RTT %u.%u ms", T.lastTenthMs/10, T.lastTenthMs%10);
+  else         snprintf(buf, sizeof(buf), "RTT --");
+  line(ROW_PEER, buf, TFT_WHITE, 1);
+
+  line(ROW_CHAN, "hold USR:", TFT_YELLOW, 1);
+  line(ROW_BW,   "run TCP TX 10s", TFT_YELLOW, 1);
+  line(ROW_IP,   "tap USR: next", TFT_GREY, 1);
+}
+
+static void drawInfoPage(void) {
+  const RadioInfo &R = halowRadioInfo();
+  char buf[32];
+
+  line(ROW_TITLE, "RADIO", TFT_CYAN, 2);
+  dispFillRect(0, ROW_TITLE + 18, TFT_W, 1, TFT_GREY);
+
+  line(ROW_RSSILBL, "MM6108 firmware", TFT_GREY, 1);
+  line(ROW_RSSIBIG + 4, R.morseFwVersion[0] ? R.morseFwVersion : "--", TFT_WHITE, 2);
+
+  snprintf(buf, sizeof(buf), "chip %.20s",
+           R.chipIdString[0] ? R.chipIdString : "--");
+  line(ROW_RATE, buf, TFT_WHITE, 1);
+
+  dispFillRect(0, ROW_SEP1, TFT_W, 1, TFT_GREY);
+  snprintf(buf, sizeof(buf), "BCF %u.%u.%u", R.bcfMajor, R.bcfMinor, R.bcfPatch);
+  line(ROW_RTT, buf, TFT_WHITE, 1);
+  snprintf(buf, sizeof(buf), "SDK %s", R.sdkVersion);
+  line(ROW_LOSS, buf, TFT_GREY, 1);
+  snprintf(buf, sizeof(buf), "fw  %s", FW_VERSION);
+  line(ROW_THR, buf, TFT_GREY, 1);
+
+  dispFillRect(0, ROW_SEP2, TFT_W, 1, TFT_GREY);
+  line(ROW_PEER,   "HaLow MAC", TFT_GREY, 1);
+  line(ROW_UPTIME, halowOwnMac().c_str(), TFT_WHITE, 1);
+  line(ROW_CHAN,   "mgmt SSID", TFT_GREY, 1);
+  line(ROW_BW,     cfgMgmtSsid().c_str(), TFT_WHITE, 1);
+  line(ROW_IP,     halowLocalIP().toString().c_str(), TFT_GREY, 1);
+  line(ROW_HEAP,   forwardModeName(g_cfg.forwardMode), TFT_GREY, 1);
+}
+
+/* Short press cycles pages; a long press performs the page's action. */
+static void doShortPress(void) {
+  s_page = (uint8_t)((s_page + 1) % PAGE_COUNT);
+  s_layout = false;
+  LOGI("UI", "page -> %u", s_page);
+}
+
+static void doLongPress(void) {
+  switch (s_page) {
+    case PAGE_TEST: {
+      String err;
+      if (thrStartTest(THR_DIR_TX, false, 10, 0, 0, err)) {
+        LOGI("UI", "TCP TX test started from the panel button");
+      } else {
+        LOGW("UI", "test could not start: %s", err.c_str());
+      }
+      break;
+    }
+    default: {
+      bool on = !rttProbing();
+      rttSetProbing(on, g_cfg.contIntervalMs ? g_cfg.contIntervalMs : 1000);
+      LOGI("UI", "continuous probe %s from the panel button", on ? "on" : "off");
+      break;
+    }
+  }
+  s_layout = false;
+}
+
+static void pollButton(void) {
+  uint8_t raw = digitalRead(UI_BTN_PIN);
+  uint32_t now = millis();
+
+  if (raw != s_btnLast) { s_btnLast = raw; s_btnAt = now; }
+  if ((uint32_t)(now - s_btnAt) < UI_BTN_DEBOUNCE) return;
+
+  if (raw != s_btnStable) {
+    s_btnStable = raw;
+    if (raw == LOW) {                 /* pressed */
+      s_pressedAt = now;
+      s_longFired = false;
+    } else {                          /* released */
+      if (!s_longFired) doShortPress();
+    }
+  } else if (raw == LOW && !s_longFired &&
+             (uint32_t)(now - s_pressedAt) >= UI_BTN_LONG_MS) {
+    s_longFired = true;               /* fire once, while still held */
+    doLongPress();
+  }
+}
+
 void uiTick(void) {
   if (!s_ok) return;
+
+  pollButton();   /* every loop, so presses are never missed */
+
   uint32_t now = millis();
   if ((uint32_t)(now - s_lastDraw) < UI_PERIOD_MS) return;
   s_lastDraw = now;
@@ -76,6 +223,9 @@ void uiTick(void) {
     dispFill(TFT_BLACK);
     s_layout = true;
   }
+
+  if (s_page == PAGE_TEST) { drawTestPage(); return; }
+  if (s_page == PAGE_INFO) { drawInfoPage(); return; }
 
   /* ---- title: role and link state ---- */
   snprintf(buf, sizeof(buf), "%-4s %s", roleName(g_cfg.role),

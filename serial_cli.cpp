@@ -168,6 +168,18 @@ static bool pinIsSafe(uint8_t p) {
   return false;
 }
 
+/*
+ * Once the panel is running, its seven lines belong to the display driver and
+ * an active SPI peripheral. Reconfiguring them underneath it hangs the board -
+ * btnscan did exactly that and killed the console with no output at all.
+ */
+static bool pinIsDisplay(uint8_t p) {
+  if (!dispPresent()) return false;
+  return p == TFT_PIN_SCL || p == TFT_PIN_SDA || p == TFT_PIN_CS ||
+         p == TFT_PIN_DC  || p == TFT_PIN_RST || p == TFT_PIN_EN ||
+         p == TFT_PIN_BL;
+}
+
 /* Candidate (SDA, SCL) pairs to try when hunting for an I2C display. */
 static const uint8_t kI2cPairs[][2] = {
   {  5,  6 },   /* the variant's declared SDA/SCL */
@@ -651,23 +663,38 @@ static void execute(char *line) {
     uint32_t secs = (uint32_t)atol(arg);
     if (secs == 0 || secs > 120) secs = 20;
 
-    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) pinMode(kSafePins[i], INPUT_PULLUP);
+    Serial.println(F("btnscan starting"));
+    Serial.flush();
+
+    bool watch[SAFE_PIN_COUNT];
+    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+      watch[i] = !pinIsDisplay(kSafePins[i]);
+      if (watch[i]) pinMode(kSafePins[i], INPUT_PULLUP);
+    }
+    if (dispPresent()) {
+      Serial.println(F("(display pins skipped - they belong to the panel)"));
+    }
     delay(50);
 
     uint8_t idle[SAFE_PIN_COUNT];
-    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) idle[i] = digitalRead(kSafePins[i]);
-
     Serial.print(F("idle state: "));
-    for (size_t i = 0; i < SAFE_PIN_COUNT; i++)
+    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+      if (!watch[i]) continue;
+      idle[i] = digitalRead(kSafePins[i]);
       if (!idle[i]) Serial.printf("GPIO%u=LOW ", kSafePins[i]);
-    Serial.println(F("\r\npress each button now (one at a time)..."));
+    }
+    Serial.println();
+    Serial.println(F("press each button now (one at a time)..."));
+    Serial.flush();
 
     uint32_t end = millis() + secs * 1000;
     while (millis() < end) {
       for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+        if (!watch[i]) continue;
         uint8_t v = digitalRead(kSafePins[i]);
         if (v != idle[i]) {
           Serial.printf("  GPIO%-2u -> %s\r\n", kSafePins[i], v ? "HIGH" : "LOW (pressed)");
+          Serial.flush();
           idle[i] = v;
         }
       }
