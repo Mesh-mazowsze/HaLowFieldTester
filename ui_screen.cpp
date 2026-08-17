@@ -266,17 +266,27 @@ void uiTick(void) {
   dispFillRect(0, ROW_SEP1, TFT_W, 1, TFT_GREY);
 
   /* ---- latency, loss, throughput ---- */
-  if (T.valid) snprintf(buf, sizeof(buf), "RTT   %u.%u ms",
-                        T.lastTenthMs / 10, T.lastTenthMs % 10);
-  else         snprintf(buf, sizeof(buf), "RTT   --");
-  line(ROW_RTT, buf, TFT_WHITE, 1);
+  /*
+   * Distinguish "the probe is switched off" from "the probe is running but has
+   * no answer yet". A bare dash for both reads as a fault when it is really
+   * just a disabled feature.
+   */
+  if (!rttProbing()) {
+    line(ROW_RTT,  "RTT   off", TFT_GREY, 1);
+    line(ROW_LOSS, "  hold USR", TFT_YELLOW, 1);
+  } else {
+    if (T.valid) snprintf(buf, sizeof(buf), "RTT   %u.%u ms",
+                          T.lastTenthMs / 10, T.lastTenthMs % 10);
+    else         snprintf(buf, sizeof(buf), "RTT   waiting");
+    line(ROW_RTT, buf, TFT_WHITE, 1);
 
-  if (T.lossPct100 != SAMPLE_NA_U16)
-    snprintf(buf, sizeof(buf), "LOSS  %u.%02u %%", T.lossPct100 / 100, T.lossPct100 % 100);
-  else
-    snprintf(buf, sizeof(buf), "LOSS  --");
-  line(ROW_LOSS, buf,
-       (T.lossPct100 != SAMPLE_NA_U16 && T.lossPct100 > 500) ? TFT_RED : TFT_WHITE, 1);
+    if (T.lossPct100 != SAMPLE_NA_U16)
+      snprintf(buf, sizeof(buf), "LOSS  %u.%02u %%", T.lossPct100 / 100, T.lossPct100 % 100);
+    else
+      snprintf(buf, sizeof(buf), "LOSS  --");
+    line(ROW_LOSS, buf,
+         (T.lossPct100 != SAMPLE_NA_U16 && T.lossPct100 > 500) ? TFT_RED : TFT_WHITE, 1);
+  }
 
   uint32_t kbps = (X.state == THR_RUNNING && X.curKbps) ? X.curKbps : X.avgKbps;
   if (kbps) snprintf(buf, sizeof(buf), "THR   %lu kbps", (unsigned long)kbps);

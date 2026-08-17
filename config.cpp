@@ -64,7 +64,13 @@ void cfgSetDefaults(AppConfig &c) {
   c.rttPort   = 5555;
   c.peerPort  = 5556;
 
-  c.contEnabled    = 0;
+  /*
+   * On by default. RTT and loss are core readings for a field tester, and the
+   * probe doubles as the traffic that keeps the rate table moving, so MCS and
+   * PHY rate stay live instead of reading "no traffic". One small packet per
+   * second is about 0.05% airtime against the EU 2.80% budget - negligible.
+   */
+  c.contEnabled    = 1;
   c.contIntervalMs = 1000;
 
   c.crc = cfgCrc(c);
