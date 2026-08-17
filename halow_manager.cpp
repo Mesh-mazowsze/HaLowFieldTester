@@ -294,7 +294,73 @@ static bool startApDirect(const ChannelInfo &ci,
 }
 
 uint16_t halowBeaconIntervalTus(void) { return s_beaconTus; }
-uint32_t halowScanDwellMs(void)       { return s_scanDwellMs; }
+
+uint32_t halowScanDwellMs(void) {
+  /*
+   * Only the STA path calls mmwlan_set_scan_config(), so on an AP this is still
+   * zero. Handing a zero dwell to mmwlan_scan_request() trips an MMOSAL assert
+   * and reboots the board, so derive the same value the STA would have used.
+   */
+  if (s_scanDwellMs) return s_scanDwellMs;
+  ChannelInfo ci;
+  if (halowChannelByNumber(g_cfg.region, g_cfg.channel, ci)) {
+    return (((uint32_t)chooseBeaconInterval(ci) * 1024UL) / 1000UL) + 120;
+  }
+  return MMWLAN_SCAN_DEFAULT_DWELL_TIME_MS;
+}
+
+/*
+ * STA re-association watchdog.
+ *
+ * The Morse driver does retry on its own, but slowly: after the AP restarted,
+ * a STA one room away took about two minutes to come back. For a field tester
+ * that walks out of range and back, two minutes of dead link is two minutes of
+ * lost measurements, and there is no way to tell "still out of range" from
+ * "the driver has wedged".
+ *
+ * So: leave the driver alone for a grace period, then force a fresh
+ * sta_disable/sta_enable cycle, backing off so a node genuinely out of range
+ * does not burn its duty-cycle budget scanning.
+ */
+#define REASSOC_GRACE_MS   20000UL
+#define REASSOC_MIN_MS     20000UL
+#define REASSOC_MAX_MS    120000UL
+
+static uint32_t s_linkDownSince   = 0;
+static uint32_t s_lastReassocMs   = 0;
+static uint32_t s_reassocBackoff  = REASSOC_MIN_MS;
+static uint32_t s_reassocAttempts = 0;
+
+uint32_t halowReassocAttempts(void) { return s_reassocAttempts; }
+
+static void reassociateSta(void) {
+  const bool open = (g_cfg.security == SEC_OPEN) || (g_cfg.halowPass[0] == '\0');
+  const char *pass = open ? "" : g_cfg.halowPass;
+
+  s_reassocAttempts++;
+
+  /* Advance the backoff first so the log states the interval actually used. */
+  s_reassocBackoff *= 2;
+  if (s_reassocBackoff > REASSOC_MAX_MS) s_reassocBackoff = REASSOC_MAX_MS;
+
+  LOGW("HALOW", "link down %lu s - forcing re-association (attempt %lu, next in %lu s)",
+       (unsigned long)((millis() - s_linkDownSince) / 1000),
+       (unsigned long)s_reassocAttempts,
+       (unsigned long)(s_reassocBackoff / 1000));
+
+  /*
+   * Go through sta_disable first. HalowSTAClass::begin() wraps
+   * mmwlan_sta_enable() in MMOSAL_ASSERT, so calling it while the previous
+   * enable is still live would panic the board rather than return an error.
+   */
+  enum mmwlan_status st = mmwlan_sta_disable();
+  if (st != MMWLAN_SUCCESS) {
+    LOGW("HALOW", "mmwlan_sta_disable() returned %d; retrying later", (int)st);
+    return;
+  }
+
+  HaLow.begin(g_cfg.halowSsid, pass, open ? MMWLAN_OPEN : MMWLAN_SAE, g_cfg.region);
+}
 
 bool halowStart(void) {
   if (s_started) {
@@ -451,6 +517,35 @@ void halowTick(void) {
       LOGW("HALOW", "%s link is down", roleName(g_cfg.role));
     }
   }
+
+  if (g_cfg.role != ROLE_STA || !s_started) return;
+
+  if (up) {
+    /* Recovered: forget the backoff so the next outage retries promptly. */
+    if (s_linkDownSince) {
+      if (s_reassocAttempts) {
+        LOGI("HALOW", "re-associated after %lu forced attempt(s)",
+             (unsigned long)s_reassocAttempts);
+      }
+      s_linkDownSince  = 0;
+      s_reassocBackoff = REASSOC_MIN_MS;
+    }
+    return;
+  }
+
+  uint32_t now = millis();
+  if (!s_linkDownSince) {
+    s_linkDownSince = now;
+    s_lastReassocMs = now;   /* the grace period starts here */
+    return;
+  }
+
+  uint32_t sinceAttempt = now - s_lastReassocMs;
+  uint32_t wait = s_reassocAttempts ? s_reassocBackoff : REASSOC_GRACE_MS;
+  if (sinceAttempt < wait) return;
+
+  s_lastReassocMs = now;
+  reassociateSta();
 }
 
 bool halowIsUp(void) {

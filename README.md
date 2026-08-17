@@ -333,6 +333,54 @@ latency in the tens-to-hundreds of ms because transmissions are spread to
 respect the duty cycle. If you need more, EU channel 6 (2 MHz) roughly doubles
 it, at the cost of occupied bandwidth.
 
+### 4b. Why the rate collapses further than the signal does
+
+Moving one node into the next room, a few metres away through one wall:
+
+| | same room, ~1 m | next room | change |
+|---|---|---|---|
+| RSSI | −31…−34 dBm | −67…−71 dBm | −36 dB |
+| MCS, idle (1 probe/s) | 7 | 4–5 | −2…−3 |
+| MCS, under TCP load | 7 | **2** | −5 |
+| TCP | 89 kbps | 25 kbps | −72 % |
+| RTT avg, idle | 225 ms | 537 ms | ×2.4 |
+| RTT max, under load | 789 ms | 5566 ms | ×7 |
+| probe loss, idle | 0.8 % | 0 % (0/69) | — |
+
+−68 dBm is not a weak signal for 802.11ah — it is tens of dB above the
+sensitivity floor for 1 MHz — so path loss alone does not explain MCS2. The
+telling detail is that **MCS is load-dependent**: 4–5 while idle, 2 while
+pushing TCP, 7 in both states on the desk. Signal quality does not change when
+you start a transfer; duty-cycle pressure does.
+
+The mechanism is a feedback loop specific to a duty-cycle-limited channel:
+
+1. Marginal SNR causes a few frames to need retries.
+2. Every retry spends airtime from the same 2.80 % budget as the data.
+3. The rate controller counts the failures and steps the MCS down.
+4. **A lower MCS occupies the channel for longer per frame.** MCS2 at 1 MHz is
+   roughly a fifth the PHY rate of MCS7, so each frame burns about five times
+   the airtime, and the budget empties five times faster.
+5. Climbing back requires successfully probing a higher rate — which needs
+   spare airtime that step 4 has just consumed. So it stays down.
+
+That is why throughput fell 72 % while the PHY rate only fell 40 %: the extra
+loss is retries and the airtime they consume, not raw modulation.
+
+Two consequences for field work:
+
+- **Watch MCS under load, not RSSI.** RSSI degrades smoothly with distance;
+  the usable link degrades in steps, and the step happens when the retry rate
+  starts eating the duty-cycle budget. The `test` command is the honest probe.
+- On an unlimited-duty-cycle channel this loop is far weaker, because retries
+  do not compete with data for a regulatory budget. It is a property of EU
+  sub-GHz operation, not of the MM6108.
+
+Not measured here: the noise floor at the remote node, which would separate
+"marginal SNR" from "interference on 865.5 MHz". `noise` reads it, but only on
+a STA — an AP returns scan state 1 (rejected) because it cannot leave the
+channel while beaconing. Reading it needs serial access to the remote node.
+
 ---
 
 ## 5. Build and flash
@@ -661,6 +709,7 @@ Two HT‑RC3268 boards, EU / 868 MHz / channel 5 / **1 MHz**, SAE:
 | **LINK DOWN** forever, other cases | Both nodes on the same region *and* channel? Same SSID/passphrase? One AP and one STA, not two of the same? |
 | Device reboots in a loop right after the `BCF …` log line | A NULL passphrase reached `HaLow.begin()`. Fixed here; in your own sketch pass `""`, never `NULL`. |
 | Very high PHY error rate with both boards on one desk | Receiver overload: at 16 dBm and ~20 cm apart the receiver sees about −2 dBm. Lower `txpower` or separate the boards — it is not a link fault. |
+| STA takes minutes to rejoin after the AP restarts, or after walking back into range | The driver's own retry is slow — measured about two minutes. The STA now forces a `sta_disable`/`sta_enable` cycle after 20 s down, then backs off 40/80/120 s. `status` shows `forced re-assoc N`; the JSON field is `link.forced_reassoc`. |
 | Link up, but **Peer node** shows `(no data)` | Peer IP wrong, or the two nodes are on different subnets. Both must be in the same /24. |
 | RSSI shows `—` on the AP node | Expected: RSSI is STA‑side. It appears once peer telemetry is live. |
 | MCS/PHY show `—` | No traffic. Enable the continuous probe. |

@@ -187,6 +187,7 @@ void buildStatusJson(String &out) {
     jsBool(out, "up", L.linkUp);
     jsNum(out, "uptime_s", (long)(L.linkUptimeMs / 1000));
     jsNum(out, "disconnects", (long)L.disconnects);
+    jsNum(out, "forced_reassoc", (long)halowReassocAttempts());
 
     if (L.rssiValid) jsNum(out, "rssi_dbm", L.rssiDbm); else jsNull(out, "rssi_dbm");
 

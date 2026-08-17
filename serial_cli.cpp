@@ -85,7 +85,10 @@ static void printStatus(void) {
 
   Serial.printf("link      : %s", L.linkUp ? "UP" : "DOWN");
   if (L.linkUp) Serial.printf("  uptime %lus", (unsigned long)(L.linkUptimeMs / 1000));
-  Serial.printf("  disconnects %lu\r\n", (unsigned long)L.disconnects);
+  Serial.printf("  disconnects %lu", (unsigned long)L.disconnects);
+  if (halowReassocAttempts())
+    Serial.printf("  forced re-assoc %lu", (unsigned long)halowReassocAttempts());
+  Serial.println();
 
   if (L.rssiValid) Serial.printf("rssi      : %d dBm\r\n", L.rssiDbm);
   else             Serial.println(F("rssi      : n/a (STA-side measurement)"));

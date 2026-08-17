@@ -59,6 +59,7 @@ bool        halowWaitForLink(uint32_t timeoutMs);
 bool        halowIsUp(void);          /* link established (AP running / STA associated) */
 uint32_t    halowLinkUptimeMs(void);  /* 0 when down */
 uint32_t    halowDisconnectCount(void);
+uint32_t    halowReassocAttempts(void);  /* forced STA re-association cycles */
 
 const RadioInfo &halowRadioInfo(void);
 
