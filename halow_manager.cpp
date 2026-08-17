@@ -363,6 +363,24 @@ bool halowStart(void) {
       return false;
     }
   } else {
+    /*
+     * The driver's internal connect scan dwells for only
+     * MMWLAN_SCAN_DEFAULT_DWELL_TIME_MS (30 ms) per channel. On a duty-cycle
+     * limited 1 MHz channel the AP has to beacon slowly (see
+     * chooseBeaconInterval), so a 30 ms dwell catches a beacon roughly one
+     * time in ten and association becomes a coin flip - measured 1 in 3 even
+     * with a working AP. Dwell for longer than one full beacon period.
+     */
+    struct mmwlan_scan_config sc = MMWLAN_SCAN_CONFIG_INIT;
+    uint32_t beaconMs = ((uint32_t)chooseBeaconInterval(ci) * 1024UL) / 1000UL;
+    sc.dwell_time_ms  = beaconMs + 120;
+    if (mmwlan_set_scan_config(&sc) == MMWLAN_SUCCESS) {
+      LOGI("HALOW", "scan dwell set to %lu ms (beacon period ~%lu ms)",
+           (unsigned long)sc.dwell_time_ms, (unsigned long)beaconMs);
+    } else {
+      LOGW("HALOW", "mmwlan_set_scan_config() failed; association may be slow");
+    }
+
     LOGI("HALOW", "starting STA, joining \"%s\" (%s)",
          g_cfg.halowSsid, open ? "OPEN" : "SAE");
     HaLow.begin(g_cfg.halowSsid, pass, open ? MMWLAN_OPEN : MMWLAN_SAE, g_cfg.region);

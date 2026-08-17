@@ -28,8 +28,13 @@
 #include "web_server.h"
 #include "serial_cli.h"
 
-/* How long to wait for the HaLow link before starting the management AP. */
+/*
+ * How long to wait for the HaLow link before starting the management AP.
+ * Set to 0 to start the 2.4 GHz AP immediately.
+ */
+#ifndef HALOW_LINK_WAIT_MS
 #define HALOW_LINK_WAIT_MS 45000
+#endif
 
 static bool s_serversStarted = false;
 
@@ -66,7 +71,7 @@ void setup() {
   halowInit();
   if (!halowStart()) {
     LOGE("BOOT", "HaLow start failed - panel will still be available");
-  } else {
+  } else if (HALOW_LINK_WAIT_MS > 0) {
     halowWaitForLink(HALOW_LINK_WAIT_MS);
   }
 

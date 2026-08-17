@@ -226,7 +226,35 @@ args.beacon_interval_tus = beaconTus;  /* 300 TU on duty-cycle-limited 1 MHz */
 It is overridable from the panel (**Config → AP beacon interval**) and the
 serial console (`beacon <TU>`) for experimentation.
 
-**Result:** EU ch5 / 1 MHz associates in ~3 s and stays up.
+**Result:** EU ch5 / 1 MHz associates and stays up.
+
+### The second half of the problem: scan dwell
+
+Fixing the beacon interval makes association *possible*, but not yet *reliable* —
+measured **1 in 3** attempts even with a healthy AP.
+
+The cause is the other side of the same coin. The driver's internal connect
+scan dwells for `MMWLAN_SCAN_DEFAULT_DWELL_TIME_MS` — **30 ms per channel**.
+With a 307 ms beacon period, a 30 ms listening window catches a beacon roughly
+one time in ten, so the STA has to rely on repeated scan passes with
+exponential backoff.
+
+So this firmware also widens the dwell to longer than one beacon period
+(`halow_manager.cpp`, STA branch):
+
+```c
+struct mmwlan_scan_config sc = MMWLAN_SCAN_CONFIG_INIT;
+sc.dwell_time_ms = beaconPeriodMs + 120;   /* ~427 ms for a 300 TU beacon */
+mmwlan_set_scan_config(&sc);
+```
+
+Measured over 10 reboots: association went from **1/3 to 9/10**, typically in
+**~7 seconds**. The cost is a slower scan, which is irrelevant here since the
+STA only scans while joining.
+
+**Takeaway:** on a duty-cycle-limited narrow channel the beacon interval and
+the scan dwell must be tuned *together*. Changing one without the other leaves
+you with a link that either never forms or forms unpredictably.
 
 ### What this means for expected performance
 
@@ -453,17 +481,22 @@ MM6108 API cannot supply them (§2). They are never fabricated.
       `HaLow.begin(ssid, NULL, …)` for an open network dereferences NULL and
       puts the device into a **panic boot loop**. `HaLow.AP()` guards against
       this; `begin()` does not. Always pass `""`, never `NULL`.
-    * The ESP32's 2.4 GHz Wi-Fi must not be started until the HaLow link is up.
-      Every Heltec example blocks on `HaLow.status() != WL_CONNECTED` before
-      calling `WiFi.softAP()` / `WiFi.begin()`. This firmware does the same,
-      with a 45 s timeout so the panel still appears if the link never comes up.
+    * This firmware starts the ESP32's 2.4 GHz Wi-Fi only after the HaLow link
+      is up (45 s timeout), matching every Heltec example, which blocks on
+      `HaLow.status() != WL_CONNECTED` before calling `WiFi.softAP()` /
+      `WiFi.begin()`. **In fairness: I measured this and found no difference** —
+      1/3 association either way, before the scan-dwell fix. It is kept because
+      it follows the vendor's documented pattern and, now that association
+      takes ~7 s, it delays the panel by only a few seconds. Do not treat it as
+      a proven requirement.
 
 ### Verified on hardware
 
 Two HT‑RC3268 boards, EU / 868 MHz / channel 5 / **1 MHz**, SAE:
 
 * Same image on both; roles set from NVS and persisted across reboots
-* Association in ~5 s; `MM6108A2`, MM firmware `1.17.6`, BCF `v12.1.0` read live
+* **Association in ~7 s, 9 out of 10 reboots** (was 1 in 3 before the scan-dwell fix)
+* `MM6108A2`, MM firmware `1.17.6`, BCF `v12.1.0` read live from the transceiver
 * Live RSSI, and **MCS7 / 1 MHz / SGI → 3.33 Mbps** decoded from the rate table
 * RTT via UDP echo (28 ms min), 0 % probe loss, peer telemetry live in both directions
 * TCP 88 kbps / UDP 82 kbps with 0.00 % datagram loss; iperf servers on both ends
