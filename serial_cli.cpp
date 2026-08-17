@@ -10,6 +10,7 @@
 #include "web_server.h"
 #include "stats.h"
 
+#include <Wire.h>
 #include <WiFi.h>
 #include <HaLow.h>
 #include "mmwlan.h"
@@ -38,7 +39,12 @@ static void printHelp(void) {
     "  factory                    reset config to defaults\r\n"
     "  ping on|off [ms]           continuous RTT probe\r\n"
     "  test tcp|udp tx|rx [s] [kbps]   throughput test\r\n"
-    "  stop                       stop tracking the current test\r\n"));
+    "  stop                       stop tracking the current test\r\n"
+    "  json [history]             dump the document the web panel consumes\r\n"
+    "  httpget [ip]               fetch /api/status from the peer over HaLow\r\n"
+    "  scan [ms]                  HaLow scan (dwell per channel)\r\n"
+    "  i2cscan [sda scl]          hunt for an I2C display on an add-on board\r\n"
+    "  btnscan [s]                identify button GPIOs on an add-on board\r\n"));
 }
 
 static void printCfg(void) {
@@ -64,6 +70,7 @@ static void printCfg(void) {
   Serial.printf("beacon    : %u TU%s\r\n", g_cfg.beaconIntervalTus,
                 g_cfg.beaconIntervalTus ? "" : " (auto)");
   Serial.printf("mgmt ssid : %s\r\n", cfgMgmtSsid().c_str());
+  Serial.printf("forwarding: %s\r\n", forwardModeName(g_cfg.forwardMode));
 }
 
 static void printStatus(void) {
@@ -136,6 +143,197 @@ static void printChans(void) {
                   (unsigned long)((ci.centreFreqHz % 1000000UL) / 100000UL),
                   ci.bwMhz, (int)ci.maxTxEirpDbm,
                   ci.dutyCyclePct100 / 100, ci.dutyCyclePct100 % 100);
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Hardware discovery helpers, for identifying an add-on board (display/buttons)
+ * whose pinout is not documented.
+ *
+ * Pins that must never be touched on the HT-RC3268:
+ *   1, 3, 8, 9, 10, 11, 12, 13, 14  MM6108 (SPI, RESET, WAKE, BUSY, LDO)
+ *   19, 20                          USB D-/D+ (would kill the USB console)
+ *   26..37                          SPI flash and OPI PSRAM
+ *   43, 44                          UART0
+ */
+static const uint8_t kSafePins[] = {
+  0, 2, 4, 5, 6, 7, 15, 16, 17, 18, 21, 38, 39, 40, 41, 42, 45, 46, 47, 48
+};
+#define SAFE_PIN_COUNT (sizeof(kSafePins) / sizeof(kSafePins[0]))
+
+static bool pinIsSafe(uint8_t p) {
+  for (size_t i = 0; i < SAFE_PIN_COUNT; i++) if (kSafePins[i] == p) return true;
+  return false;
+}
+
+/* Candidate (SDA, SCL) pairs to try when hunting for an I2C display. */
+static const uint8_t kI2cPairs[][2] = {
+  {  5,  6 },   /* the variant's declared SDA/SCL */
+  {  6,  5 },
+  { 17, 18 },
+  { 41, 42 },
+  { 40, 39 },
+  { 47, 48 },
+  { 45, 46 },
+  {  4,  7 },
+  {  2, 15 },
+  { 21, 16 },
+};
+#define I2C_PAIR_COUNT (sizeof(kI2cPairs) / sizeof(kI2cPairs[0]))
+
+static const char *i2cGuess(uint8_t addr) {
+  switch (addr) {
+    case 0x3C: case 0x3D: return "SSD1306 / SH1106 OLED";
+    case 0x27: case 0x3F: return "PCF8574 (LCD backpack)";
+    case 0x76: case 0x77: return "BMP/BME280";
+    case 0x68:            return "RTC / IMU";
+    case 0x20: case 0x21: return "MCP23017 / PCF8574 GPIO expander";
+    default:              return "unknown";
+  }
+}
+
+static void scanI2cPair(uint8_t sda, uint8_t scl) {
+  Wire.end();
+  if (!Wire.begin((int)sda, (int)scl, 100000)) {
+    Serial.printf("  SDA=%-2u SCL=%-2u : begin() failed\r\n", sda, scl);
+    return;
+  }
+
+  uint8_t addrs[16];
+  uint8_t found = 0;
+  for (uint8_t a = 0x08; a <= 0x77; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      if (found < sizeof(addrs)) addrs[found] = a;
+      found++;
+    }
+  }
+  Wire.end();
+
+  /*
+   * Every address acknowledging is not 112 chips - it means the bus is stuck:
+   * SDA held low, or SDA and SCL shorted together. Report the fault rather
+   * than a page of nonsense.
+   */
+  if (found > 12) {
+    Serial.printf("  SDA=%-2u SCL=%-2u : BUS FAULT - all %u addresses ACK "
+                  "(SDA stuck low or SDA/SCL shorted; not I2C here)\r\n",
+                  sda, scl, found);
+    return;
+  }
+  if (!found) {
+    Serial.printf("  SDA=%-2u SCL=%-2u : -\r\n", sda, scl);
+    return;
+  }
+  for (uint8_t i = 0; i < found; i++) {
+    Serial.printf("  SDA=%-2u SCL=%-2u : device 0x%02X  (%s)\r\n",
+                  sda, scl, addrs[i], i2cGuess(addrs[i]));
+  }
+}
+
+/*
+ * Bit-banged I2C probe.
+ *
+ * The Wire driver reported an ACK from all 112 addresses on some pin pairs,
+ * which is not believable. This drives the bus by hand so the ACK bit is read
+ * directly and cannot be masked by the peripheral's own error handling.
+ * Lines are open-drain: driven low, or released to the external pull-up.
+ */
+#define BB_DELAY_US 5
+
+static inline void bbRelease(uint8_t p) { pinMode(p, INPUT_PULLUP); }
+static inline void bbLow(uint8_t p)     { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
+
+static void bbStart(uint8_t sda, uint8_t scl) {
+  bbRelease(sda); bbRelease(scl); delayMicroseconds(BB_DELAY_US);
+  bbLow(sda);     delayMicroseconds(BB_DELAY_US);
+  bbLow(scl);     delayMicroseconds(BB_DELAY_US);
+}
+
+static void bbStop(uint8_t sda, uint8_t scl) {
+  bbLow(sda);     delayMicroseconds(BB_DELAY_US);
+  bbRelease(scl); delayMicroseconds(BB_DELAY_US);
+  bbRelease(sda); delayMicroseconds(BB_DELAY_US);
+}
+
+/* Returns the ACK bit sampled after the 8th clock: 0 = ACK, 1 = NAK. */
+static uint8_t bbWriteByte(uint8_t sda, uint8_t scl, uint8_t v) {
+  for (int i = 7; i >= 0; i--) {
+    if ((v >> i) & 1) bbRelease(sda); else bbLow(sda);
+    delayMicroseconds(BB_DELAY_US);
+    bbRelease(scl);   delayMicroseconds(BB_DELAY_US);
+    bbLow(scl);       delayMicroseconds(BB_DELAY_US);
+  }
+  bbRelease(sda);     delayMicroseconds(BB_DELAY_US);
+  bbRelease(scl);     delayMicroseconds(BB_DELAY_US);
+  uint8_t ack = digitalRead(sda);
+  bbLow(scl);         delayMicroseconds(BB_DELAY_US);
+  return ack;
+}
+
+static void bbScan(uint8_t sda, uint8_t scl) {
+  /*
+   * Bus recovery first. A device left mid-byte by an earlier malformed
+   * transaction will hold SDA low forever, which makes every address appear to
+   * ACK. Clocking SCL at least 9 times with SDA released lets it finish the
+   * byte, then a STOP returns the bus to idle.
+   */
+  bbRelease(sda);
+  for (int i = 0; i < 16; i++) {
+    bbRelease(scl); delayMicroseconds(BB_DELAY_US);
+    bbLow(scl);     delayMicroseconds(BB_DELAY_US);
+  }
+  bbRelease(scl);
+  bbStop(sda, scl);
+  delayMicroseconds(50);
+
+  /* Idle levels: real I2C sits high on both via pull-ups. */
+  bbRelease(sda); bbRelease(scl); delayMicroseconds(50);
+  Serial.printf("idle: SDA(%u)=%d SCL(%u)=%d%s\r\n", sda, digitalRead(sda),
+                scl, digitalRead(scl),
+                (digitalRead(sda) && digitalRead(scl)) ? "  (looks like an idle I2C bus)"
+                                                       : "  (NOT an idle I2C bus)");
+  uint8_t found = 0, addrs[16];
+  for (uint8_t a = 0x08; a <= 0x77; a++) {
+    bbStart(sda, scl);
+    uint8_t ack = bbWriteByte(sda, scl, (uint8_t)(a << 1));
+    bbStop(sda, scl);
+    if (ack == 0) { if (found < 16) addrs[found] = a; found++; }
+  }
+  pinMode(sda, INPUT); pinMode(scl, INPUT);
+
+  if (found > 12) {
+    Serial.printf("  all %u addresses ACK -> bus is stuck low, no usable I2C here\r\n", found);
+  } else if (!found) {
+    Serial.println(F("  no devices"));
+  } else {
+    for (uint8_t i = 0; i < found; i++)
+      Serial.printf("  device 0x%02X  (%s)\r\n", addrs[i], i2cGuess(addrs[i]));
+  }
+}
+
+/*
+ * Characterises every safe GPIO by reading it with the internal pull-up and
+ * then the pull-down. This tells apart a floating pin from one the add-on
+ * board actually drives or ties to a rail.
+ */
+static void probePins(void) {
+  Serial.println(F("pin  pull-up  pull-down  interpretation"));
+  for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+    uint8_t p = kSafePins[i];
+    pinMode(p, INPUT_PULLUP);   delayMicroseconds(600);
+    uint8_t up = digitalRead(p);
+    pinMode(p, INPUT_PULLDOWN); delayMicroseconds(600);
+    uint8_t dn = digitalRead(p);
+    pinMode(p, INPUT);
+
+    const char *what;
+    if (up && !dn)      what = "floating (nothing attached)";
+    else if (!up && !dn) what = "tied LOW  <-- driven or grounded";
+    else if (up && dn)   what = "tied HIGH <-- driven or pulled up";
+    else                 what = "inconsistent";
+    Serial.printf("%-4u %-8u %-10u %s\r\n", p, up, dn, what);
   }
 }
 
@@ -284,6 +482,100 @@ static void execute(char *line) {
     Serial.printf("reply: \"%s\"  %lu bytes in %lu ms\r\n",
                   firstLine.c_str(), (unsigned long)bytes,
                   (unsigned long)(millis() - t0));
+    return;
+  }
+
+  if (!strcmp(line, "fwd")) {
+    if      (!strcmp(arg, "off") || !strcmp(arg, "isolated")) g_cfg.forwardMode = FWD_ISOLATED;
+    else if (!strcmp(arg, "nat"))                             g_cfg.forwardMode = FWD_NAT;
+    else if (!strcmp(arg, "route"))                           g_cfg.forwardMode = FWD_ROUTE;
+    else { Serial.println(F("usage: fwd off|nat|route")); return; }
+    Serial.printf("forwarding = %s (save + reboot to apply)\r\n",
+                  forwardModeName(g_cfg.forwardMode));
+    return;
+  }
+
+  if (!strcmp(line, "blink")) {
+    /* Blinks the on-board LED so you can tell which physical node this is. */
+    uint32_t secs = (uint32_t)atol(arg);
+    if (secs == 0 || secs > 60) secs = 10;
+    Serial.printf("blinking LED on GPIO%d for %lu s - watch the boards\r\n",
+                  LED_BUILTIN, (unsigned long)secs);
+    pinMode(LED_BUILTIN, OUTPUT);
+    uint32_t end = millis() + secs * 1000;
+    while (millis() < end) {
+      digitalWrite(LED_BUILTIN, HIGH); delay(120);
+      digitalWrite(LED_BUILTIN, LOW);  delay(120);
+    }
+    Serial.println(F("blink done"));
+    return;
+  }
+
+  if (!strcmp(line, "i2cscan")) {
+    int sda = -1, scl = -1;
+    if (sscanf(arg, "%d %d", &sda, &scl) == 2) {
+      if (!pinIsSafe((uint8_t)sda) || !pinIsSafe((uint8_t)scl)) {
+        Serial.println(F("refusing: one of those pins is reserved (MM6108/USB/flash/UART)"));
+        return;
+      }
+      Serial.println(F("scanning given pair..."));
+      scanI2cPair((uint8_t)sda, (uint8_t)scl);
+    } else {
+      Serial.println(F("sweeping candidate SDA/SCL pairs..."));
+      for (size_t i = 0; i < I2C_PAIR_COUNT; i++) {
+        scanI2cPair(kI2cPairs[i][0], kI2cPairs[i][1]);
+        delay(5);
+      }
+      Serial.println(F("done. usage for a specific pair: i2cscan <sda> <scl>"));
+    }
+    return;
+  }
+
+  if (!strcmp(line, "pins")) { probePins(); return; }
+
+  if (!strcmp(line, "i2cbb")) {
+    int sda = -1, scl = -1;
+    if (sscanf(arg, "%d %d", &sda, &scl) != 2 ||
+        !pinIsSafe((uint8_t)sda) || !pinIsSafe((uint8_t)scl)) {
+      Serial.println(F("usage: i2cbb <sda> <scl>   (safe pins only)"));
+      return;
+    }
+    Serial.printf("bit-banged I2C probe on SDA=%d SCL=%d\r\n", sda, scl);
+    bbScan((uint8_t)sda, (uint8_t)scl);
+    return;
+  }
+
+  if (!strcmp(line, "btnscan")) {
+    /*
+     * Samples every safe GPIO with an internal pull-up and reports the ones
+     * that get pulled low - i.e. the buttons on the add-on board.
+     */
+    uint32_t secs = (uint32_t)atol(arg);
+    if (secs == 0 || secs > 120) secs = 20;
+
+    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) pinMode(kSafePins[i], INPUT_PULLUP);
+    delay(50);
+
+    uint8_t idle[SAFE_PIN_COUNT];
+    for (size_t i = 0; i < SAFE_PIN_COUNT; i++) idle[i] = digitalRead(kSafePins[i]);
+
+    Serial.print(F("idle state: "));
+    for (size_t i = 0; i < SAFE_PIN_COUNT; i++)
+      if (!idle[i]) Serial.printf("GPIO%u=LOW ", kSafePins[i]);
+    Serial.println(F("\r\npress each button now (one at a time)..."));
+
+    uint32_t end = millis() + secs * 1000;
+    while (millis() < end) {
+      for (size_t i = 0; i < SAFE_PIN_COUNT; i++) {
+        uint8_t v = digitalRead(kSafePins[i]);
+        if (v != idle[i]) {
+          Serial.printf("  GPIO%-2u -> %s\r\n", kSafePins[i], v ? "HIGH" : "LOW (pressed)");
+          idle[i] = v;
+        }
+      }
+      delay(15);
+    }
+    Serial.println(F("btnscan finished"));
     return;
   }
 

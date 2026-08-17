@@ -24,6 +24,20 @@ enum SecurityMode : uint8_t {
 };
 
 /*
+ * What the node does with traffic between the management Wi-Fi and HaLow.
+ *
+ * The default is deliberately ISOLATED. This is a measurement instrument: a
+ * phone left on the panel will otherwise push background traffic (app updates,
+ * sync, push notifications) across the HaLow link and quietly corrupt the very
+ * throughput and loss figures you are trying to read.
+ */
+enum ForwardMode : uint8_t {
+  FWD_ISOLATED = 0,  /* no forwarding; clients get no default route     */
+  FWD_NAT      = 1,  /* NAPT - works anywhere, but stacks into dbl NAT  */
+  FWD_ROUTE    = 2,  /* plain forwarding; needs return routes upstream  */
+};
+
+/*
  * Stored as a single blob in NVS. Keep it POD and versioned: a size/version
  * mismatch falls back to defaults rather than loading garbage.
  */
@@ -63,6 +77,7 @@ struct AppConfig {
   char     mgmtSsid[33];    /* empty => auto "HaLow-Tester-XXXX" */
   char     mgmtPass[65];
   uint8_t  mgmtChannel;
+  uint8_t  forwardMode;     /* ForwardMode */
 
   /* --- service ports --- */
   uint16_t iperfPort;
@@ -85,6 +100,7 @@ void        cfgFactoryReset(void);
 
 const char *roleName(uint8_t role);
 const char *securityName(uint8_t sec);
+const char *forwardModeName(uint8_t mode);
 
 /* Management SSID actually in use (resolves the "auto" case). */
 String      cfgMgmtSsid(void);

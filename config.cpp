@@ -57,6 +57,8 @@ void cfgSetDefaults(AppConfig &c) {
   c.mgmtSsid[0] = '\0'; /* auto */
   strlcpy(c.mgmtPass, "halowtester", sizeof(c.mgmtPass));
   c.mgmtChannel = 6;
+  /* Isolated by default so panel clients cannot pollute the measurements. */
+  c.forwardMode = FWD_ISOLATED;
 
   c.iperfPort = 5001;
   c.rttPort   = 5555;
@@ -131,6 +133,14 @@ const char *roleName(uint8_t role) {
 
 const char *securityName(uint8_t sec) {
   return (sec == SEC_OPEN) ? "OPEN" : "SAE";
+}
+
+const char *forwardModeName(uint8_t mode) {
+  switch (mode) {
+    case FWD_NAT:   return "NAT";
+    case FWD_ROUTE: return "ROUTE";
+    default:        return "ISOLATED";
+  }
 }
 
 String cfgHostname(void) {

@@ -13,6 +13,7 @@
 #include <WebServer.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
+#include <dhcpserver/dhcpserver.h>
 #include <esp_system.h>
 
 #define SSE_PORT        81
@@ -122,6 +123,7 @@ void buildStatusJson(String &out) {
     jsStr(out, "wifi_mac", WiFi.softAPmacAddress());
     jsStr(out, "halow_mac", halowOwnMac());
     jsStr(out, "mgmt_ssid", cfgMgmtSsid());
+    jsStr(out, "forward_mode", forwardModeName(g_cfg.forwardMode));
     jsNum(out, "mgmt_clients", (long)WiFi.softAPgetStationNum());
     jsStr(out, "reset_reason", resetReasonStr());
   }
@@ -470,6 +472,7 @@ static void hConfigGet(void) {
   jsStr(j, "mgmt_ssid", g_cfg.mgmtSsid);
   jsStr(j, "mgmt_pass", g_cfg.mgmtPass);
   jsNum(j, "mgmt_channel", g_cfg.mgmtChannel);
+  jsNum(j, "forward_mode", g_cfg.forwardMode);
   jsNum(j, "iperf_port", g_cfg.iperfPort);
   jsNum(j, "rtt_port", g_cfg.rttPort);
   jsNum(j, "peer_port", g_cfg.peerPort);
@@ -553,6 +556,11 @@ static void hConfigPost(void) {
     String p = s_http.arg("mgmt_pass");
     if (p.length() > 0 && p.length() < 8) err = "management password must be at least 8 characters";
     else strlcpy(g_cfg.mgmtPass, p.c_str(), sizeof(g_cfg.mgmtPass));
+  }
+  if (s_http.hasArg("forward_mode")) {
+    long f = s_http.arg("forward_mode").toInt();
+    if (f < 0 || f > 2) err = "forward mode must be 0 (isolated), 1 (NAT) or 2 (route)";
+    else g_cfg.forwardMode = (uint8_t)f;
   }
   if (s_http.hasArg("mgmt_channel")) {
     long c = s_http.arg("mgmt_channel").toInt();
@@ -759,6 +767,24 @@ void webInit(void) {
   WiFi.mode(WIFI_AP);
   WiFi.softAPsetHostname(cfgHostname().c_str());
 
+  /*
+   * DHCP options have to be set while the server is stopped, i.e. before
+   * softAP() brings it up. In ISOLATED mode we withhold the router and DNS
+   * options, so panel clients get an address but no default route and their
+   * traffic never reaches the HaLow link.
+   */
+  esp_netif_t *apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (apNetif) {
+    dhcps_offer_t offerRouter = (g_cfg.forwardMode == FWD_ISOLATED) ? 0 : OFFER_ROUTER;
+    dhcps_offer_t offerDns    = (g_cfg.forwardMode == FWD_ISOLATED) ? 0 : OFFER_DNS;
+    esp_netif_dhcps_option(apNetif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
+                           &offerRouter, sizeof(offerRouter));
+    esp_netif_dhcps_option(apNetif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_DOMAIN_NAME_SERVER,
+                           &offerDns, sizeof(offerDns));
+  }
+
   String ssid = cfgMgmtSsid();
   const char *pass = (strlen(g_cfg.mgmtPass) >= 8) ? g_cfg.mgmtPass : NULL;
   bool ok = WiFi.softAP(ssid.c_str(), pass, g_cfg.mgmtChannel);
@@ -816,15 +842,28 @@ void webInit(void) {
    * can answer. Only forwarded traffic is affected; the local panel is
    * untouched, and the default route is deliberately left alone.
    */
-  esp_netif_t *apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (apNetif) {
-    esp_err_t err = esp_netif_napt_enable(apNetif);
-    if (err == ESP_OK) {
-      LOGI("WEB", "NAPT enabled: the peer's panel is reachable at http://%s/",
-           IPAddress(g_cfg.peerIp).toString().c_str());
-    } else {
-      LOGW("WEB", "esp_netif_napt_enable() failed (0x%x); the peer's panel will "
-                  "only be reachable from its own Wi-Fi", err);
+    switch (g_cfg.forwardMode) {
+      case FWD_NAT: {
+        esp_err_t err = esp_netif_napt_enable(apNetif);
+        if (err == ESP_OK) {
+          LOGI("WEB", "forwarding: NAT - the peer's panel is reachable at http://%s/",
+               IPAddress(g_cfg.peerIp).toString().c_str());
+        } else {
+          LOGW("WEB", "esp_netif_napt_enable() failed (0x%x)", err);
+        }
+        break;
+      }
+      case FWD_ROUTE:
+        esp_netif_napt_disable(apNetif);
+        LOGI("WEB", "forwarding: ROUTE (no NAT) - upstream needs a route back to %s/24",
+             WiFi.softAPIP().toString().c_str());
+        break;
+      default:
+        esp_netif_napt_disable(apNetif);
+        LOGI("WEB", "forwarding: ISOLATED - panel clients get no default route, so "
+                    "they cannot disturb the measurements");
+        break;
     }
   }
 }

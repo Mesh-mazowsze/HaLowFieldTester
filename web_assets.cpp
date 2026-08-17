@@ -213,7 +213,21 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
         <div><label>SSID (blank = auto)</label><input name="mgmt_ssid" maxlength="32"></div>
         <div><label>Password (min 8 chars)</label><input name="mgmt_pass" maxlength="64"></div>
         <div><label>Channel</label><input type="number" name="mgmt_channel" min="1" max="13"></div>
+        <div><label>Forwarding to HaLow</label>
+          <select name="forward_mode">
+            <option value="0">Isolated (recommended)</option>
+            <option value="1">NAT</option>
+            <option value="2">Route (no NAT)</option>
+          </select></div>
       </div>
+      <div class="hint"><strong>Isolated</strong> gives panel clients an address
+        but no default route, so a phone left connected cannot push background
+        traffic over the HaLow link and distort your measurements. Choose
+        <strong>NAT</strong> to reach the peer's panel or the internet through
+        the link — simple, but it stacks into double NAT when both nodes route.
+        <strong>Route</strong> forwards without rewriting addresses (no double
+        NAT, end-to-end addressing) but the upstream router needs a static route
+        back to this subnet.</div>
     </div>
 
     <div class="card">
@@ -506,6 +520,7 @@ function renderStatus(d){
     ['Wi-Fi MAC (mgmt)', D.wifi_mac],
     ['HaLow MAC',     D.halow_mac],
     ['Mgmt SSID',     D.mgmt_ssid],
+    ['Forwarding',    D.forward_mode],
     ['Mgmt clients',  D.mgmt_clients],
     ['Reset reason',  D.reset_reason],
   ]);
