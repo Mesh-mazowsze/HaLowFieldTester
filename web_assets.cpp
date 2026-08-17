@@ -61,6 +61,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <div class="card">
     <h2>Link statistics</h2>
     <table class="kv" id="tLink"></table>
+    <div class="hint">RSSI and the rate table are measured by the <em>station</em>.
+      On the AP node these arrive over the peer telemetry link and are marked
+      <em>(peer)</em>. A dash means the value is genuinely unavailable from the
+      MM6108 API — it is never estimated.</div>
   </div>
 
   <div class="card">
@@ -92,6 +96,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
         <option value="1:3600">60 minutes</option>
       </select>
       <button class="btn small" id="btnRefreshHist">Refresh</button>
+      <button class="btn small ghost" id="btnStatsReset">Clear history</button>
     </div>
     <div class="hint">Held in RAM only; cleared on reboot.</div>
   </div>
@@ -444,6 +449,9 @@ function renderStatus(d){
     ['Regulatory max EIRP', has(H.max_eirp_dbm)? H.max_eirp_dbm+' dBm' : null],
     ['Configured TX power', has(H.tx_power_dbm)? H.tx_power_dbm+' dBm'+(H.tx_power_is_override?' (override)':' (regulatory max)') : null],
     ['Regulatory duty cycle', has(H.duty_cycle_pct)? H.duty_cycle_pct+' %' : null],
+    ['AP beacon interval', has(H.beacon_interval_tus)?
+        H.beacon_interval_tus+' TU ('+Math.round(H.beacon_interval_tus*1.024)+' ms)' : null],
+    ['STA scan dwell',   has(H.scan_dwell_ms)? H.scan_dwell_ms+' ms' : null],
     ['SSID',             H.ssid],
     ['Security',         H.security],
     ['IP address',       H.ip],
@@ -459,16 +467,19 @@ function renderStatus(d){
     ['State',              L.up ? 'associated' : 'down'],
     ['Association uptime', dur(L.uptime_s)],
     ['Disconnects',        L.disconnects],
-    ['RSSI',               fmtOrNull(L.rssi_dbm,' dBm')],
+    ['RSSI',               localOrPeer(L.rssi_dbm, P.rssi_dbm, ' dBm')],
     ['SNR',                null],
     ['Noise floor',        null],
-    ['MCS',                L.mcs],
-    ['Bandwidth',          has(L.bw_mhz)? L.bw_mhz+' MHz' : null],
+    ['MCS',                localOrPeer(L.mcs, P.mcs, '')],
+    ['Bandwidth',          localOrPeer(L.bw_mhz, P.bw_mhz, ' MHz')],
     ['Guard interval',     has(L.short_gi)? (L.short_gi?'short':'long') : null],
-    ['PHY rate',           has(L.phy_rate_kbps)? mbps(L.phy_rate_kbps)+' Mbps' : null],
+    ['PHY rate',           localOrPeer(has(L.phy_rate_kbps)? mbps(L.phy_rate_kbps) : null,
+                                       has(P.phy_rate_kbps)? mbps(P.phy_rate_kbps) : null, ' Mbps')],
     ['PHY error rate',     has(L.phy_per_pct)? L.phy_per_pct.toFixed(2)+' %' : null],
+    ['Rate reading age',   has(L.rate_age_ms)? L.rate_age_ms+' ms' : null],
     ['Frames attempted',   L.frames_attempted],
     ['Frames succeeded',   L.frames_succeeded],
+    ['UMAC RSSI',          has(L.umac_rssi_dbm)? L.umac_rssi_dbm+' dBm' : null],
     ['TX queue drops',     L.txq_dropped],
     ['RX queue drops',     L.rxq_dropped],
     ['RX CCMP failures',   L.rx_ccmp_failures],
@@ -519,6 +530,17 @@ function renderStatus(d){
 }
 
 function fmtOrNull(v, unit){ return has(v) ? (v + (unit||'')) : null; }
+
+/*
+ * RSSI and the rate table are STA-side measurements, so on the AP node they
+ * are legitimately absent locally. Rather than showing a bare dash, fall back
+ * to the value the peer reported and label where it came from.
+ */
+function localOrPeer(local, peer, unit){
+  if(has(local)) return local + (unit||'');
+  if(has(peer))  return peer + (unit||'') + ' (peer)';
+  return null;
+}
 
 const THR_STATE = ['idle','arming','running','done','failed'];
 function renderThr(T){
@@ -654,6 +676,10 @@ function loadHistory(){
   }).catch(()=>{});
 }
 $('#btnRefreshHist').onclick = loadHistory;
+$('#btnStatsReset').onclick = () => {
+  if(confirm('Clear stored history and link counters?'))
+    fetch('/api/stats/reset',{method:'POST'}).then(loadHistory);
+};
 $('#histWindow').onchange = loadHistory;
 window.addEventListener('resize', () => {
   if($('#charts').classList.contains('active')) loadHistory();

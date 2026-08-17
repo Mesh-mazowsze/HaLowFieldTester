@@ -10,7 +10,12 @@
 #define RTT_TYPE_PROBE  0
 #define RTT_TYPE_REPLY  1
 #define RTT_WINDOW      64
-#define RTT_TIMEOUT_MS  2000
+/*
+ * Generous, because it has to be. On a duty-cycle-limited EU 1 MHz link a
+ * round trip of several seconds is normal, not a failure - measured up to
+ * 4.4 s. A short timeout here would report loss that did not happen.
+ */
+#define RTT_TIMEOUT_MS  8000
 
 struct __attribute__((packed)) RttPacket {
   uint32_t magic;
@@ -143,6 +148,15 @@ static void handleRx(void) {
       ProbeSlot *p = slotFor(seq);
       if (p->used && p->seq == seq && !p->acked) {
         p->acked = true;
+        /*
+         * A reply can still arrive after the probe was written off as lost.
+         * Take it back off the lost tally, otherwise received + lost exceeds
+         * sent and the loss figure is inflated.
+         */
+        if (p->counted && s_stats.lost > 0) {
+          s_stats.lost--;
+          p->counted = false;
+        }
         s_stats.received++;
         recordRtt(millis() - ntohl(pkt.txMs));
       }

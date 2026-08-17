@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_mac.h>
+#include <esp_netif.h>
 #include <esp_system.h>
 
 #define SSE_PORT        81
@@ -166,6 +167,15 @@ void buildStatusJson(String &out) {
     jsStr(out, "peer_ip", IPAddress(g_cfg.peerIp).toString());
     jsStr(out, "mac", halowOwnMac());
     jsStr(out, "peer_mac", g_cfg.role == ROLE_STA ? halowPeerMac() : String(P.mac));
+
+    /*
+     * Timing actually programmed into the radio. Both matter a great deal on
+     * duty-cycle-limited 1 MHz channels, so they belong on the dashboard.
+     */
+    if (halowBeaconIntervalTus()) jsNum(out, "beacon_interval_tus", halowBeaconIntervalTus());
+    else                          jsNull(out, "beacon_interval_tus");
+    if (halowScanDwellMs())       jsNum(out, "scan_dwell_ms", (long)halowScanDwellMs());
+    else                          jsNull(out, "scan_dwell_ms");
   }
   out += '}';
 
@@ -353,10 +363,45 @@ static void hStatus(void) {
   String j; buildStatusJson(j); sendJson(j);
 }
 
+/*
+ * Extracts one top-level object from the status document, so /api/halow and
+ * /api/stats return the documented subset rather than the whole thing.
+ * The document is flat (one level of nested objects), so brace counting is
+ * sufficient and avoids pulling in a JSON parser.
+ */
+static bool extractSection(const String &doc, const char *name, String &out) {
+  String key = String("\"") + name + "\":";
+  int k = doc.indexOf(key);
+  if (k < 0) return false;
+  int start = doc.indexOf('{', k + key.length());
+  if (start < 0) return false;
+
+  int depth = 0;
+  bool inStr = false, esc = false;
+  for (int i = start; i < (int)doc.length(); i++) {
+    char c = doc[i];
+    if (esc)            { esc = false; continue; }
+    if (c == '\\')      { esc = true;  continue; }
+    if (c == '"')       { inStr = !inStr; continue; }
+    if (inStr)          continue;
+    if (c == '{')       depth++;
+    else if (c == '}') {
+      if (--depth == 0) { out = doc.substring(start, i + 1); return true; }
+    }
+  }
+  return false;
+}
+
+static void sendSection(const char *name) {
+  String doc;
+  buildStatusJson(doc);
+  String sec;
+  if (extractSection(doc, name, sec)) sendJson(sec);
+  else                                sendJson(doc);   /* should not happen */
+}
+
 static void hHalow(void) {
-  String full; buildStatusJson(full);
-  /* Keep the sub-resources simple and cheap: return the whole document. */
-  sendJson(full);
+  sendSection("halow");
 }
 
 static void hHistory(void) {
@@ -657,7 +702,7 @@ static void hExportJson(void) {
 }
 
 static void hStats(void) {
-  String j; buildStatusJson(j); sendJson(j);
+  sendSection("link");
 }
 
 static void sendProgmem(const char *body, const char *type) {
@@ -760,6 +805,28 @@ void webInit(void) {
   s_sse.begin();
   s_sse.setNoDelay(true);
   LOGI("WEB", "HTTP server on port 80, SSE stream on port %u", SSE_PORT);
+
+  /*
+   * Let a phone on the management Wi-Fi reach the *other* node's panel at its
+   * HaLow address (e.g. http://192.168.50.1/ while connected to this node).
+   *
+   * Routing there already works - the HaLow subnet is directly connected - but
+   * the far node has no route back to 192.168.4.x, so replies would be
+   * dropped. NAPT rewrites the source to our HaLow address, which the far node
+   * can answer. Only forwarded traffic is affected; the local panel is
+   * untouched, and the default route is deliberately left alone.
+   */
+  esp_netif_t *apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (apNetif) {
+    esp_err_t err = esp_netif_napt_enable(apNetif);
+    if (err == ESP_OK) {
+      LOGI("WEB", "NAPT enabled: the peer's panel is reachable at http://%s/",
+           IPAddress(g_cfg.peerIp).toString().c_str());
+    } else {
+      LOGW("WEB", "esp_netif_napt_enable() failed (0x%x); the peer's panel will "
+                  "only be reachable from its own Wi-Fi", err);
+    }
+  }
 }
 
 void webTick(void) {

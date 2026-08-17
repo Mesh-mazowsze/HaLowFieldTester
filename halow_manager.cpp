@@ -13,6 +13,8 @@ static uint32_t  s_linkUpSince   = 0;
 static uint32_t  s_disconnects   = 0;
 static bool      s_started       = false;
 static bool      s_apEnabled     = false;
+static uint16_t  s_beaconTus     = 0;   /* as programmed, AP role */
+static uint32_t  s_scanDwellMs   = 0;   /* as programmed, STA role */
 
 /* ------------------------------------------------------------------ */
 /* Regulatory database access                                          */
@@ -287,8 +289,12 @@ static bool startApDirect(const ChannelInfo &ci,
          ci.dutyCyclePct100 / 100, ci.dutyCyclePct100 % 100);
   }
   s_apEnabled = true;
+  s_beaconTus = beaconTus;
   return true;
 }
+
+uint16_t halowBeaconIntervalTus(void) { return s_beaconTus; }
+uint32_t halowScanDwellMs(void)       { return s_scanDwellMs; }
 
 bool halowStart(void) {
   if (s_started) {
@@ -375,6 +381,7 @@ bool halowStart(void) {
     uint32_t beaconMs = ((uint32_t)chooseBeaconInterval(ci) * 1024UL) / 1000UL;
     sc.dwell_time_ms  = beaconMs + 120;
     if (mmwlan_set_scan_config(&sc) == MMWLAN_SUCCESS) {
+      s_scanDwellMs = sc.dwell_time_ms;
       LOGI("HALOW", "scan dwell set to %lu ms (beacon period ~%lu ms)",
            (unsigned long)sc.dwell_time_ms, (unsigned long)beaconMs);
     } else {

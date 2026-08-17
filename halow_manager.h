@@ -62,6 +62,10 @@ uint32_t    halowDisconnectCount(void);
 
 const RadioInfo &halowRadioInfo(void);
 
+/* Values actually programmed at start-up (0 if not applicable to the role). */
+uint16_t    halowBeaconIntervalTus(void);  /* AP role */
+uint32_t    halowScanDwellMs(void);        /* STA role */
+
 /* Regulatory helpers, read from the library's own regulatory database. */
 uint8_t     halowChannelCount(const char *region);
 bool        halowChannelAt(const char *region, uint8_t index, ChannelInfo &out);

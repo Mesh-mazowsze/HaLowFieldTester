@@ -7,6 +7,10 @@
 #include "peer_link.h"
 #include "throughput_test.h"
 
+#include "web_server.h"
+#include "stats.h"
+
+#include <WiFi.h>
 #include <HaLow.h>
 #include "mmwlan.h"
 
@@ -223,6 +227,66 @@ static void execute(char *line) {
 
   if (!strcmp(line, "stop")) { thrAbort(); Serial.println(F("ok")); return; }
 
+  /*
+   * Dumps the exact payloads the web panel consumes, so they can be inspected
+   * and validated without a Wi-Fi client attached.
+   */
+  if (!strcmp(line, "json")) {
+    String j;
+    if (!strcmp(arg, "history")) {
+      histJson(j, 0, 20, 0);
+    } else {
+      buildStatusJson(j);
+    }
+    Serial.println(F("---JSON-BEGIN---"));
+    /* Chunked so a long document is not lost in the USB CDC TX buffer. */
+    for (size_t i = 0; i < j.length(); i += 128) {
+      Serial.print(j.substring(i, i + 128));
+      Serial.flush();
+      delay(4);
+    }
+    Serial.println();
+    Serial.println(F("---JSON-END---"));
+    Serial.printf("length: %u bytes\r\n", (unsigned)j.length());
+    return;
+  }
+
+  /* Checks whether the peer's web panel is reachable over the HaLow link. */
+  if (!strcmp(line, "httpget")) {
+    IPAddress target;
+    if (!target.fromString(arg[0] ? arg : IPAddress(g_cfg.peerIp).toString().c_str())) {
+      Serial.println(F("usage: httpget <ip>"));
+      return;
+    }
+    Serial.printf("GET http://%s/api/status ...\r\n", target.toString().c_str());
+    WiFiClient c;
+    c.setTimeout(8);
+    uint32_t t0 = millis();
+    if (!c.connect(target, 80, 8000)) {
+      Serial.println(F("connect FAILED"));
+      return;
+    }
+    c.printf("GET /api/status HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             target.toString().c_str());
+    uint32_t bytes = 0;
+    String firstLine;
+    uint32_t deadline = millis() + 10000;
+    while (c.connected() && millis() < deadline) {
+      while (c.available()) {
+        char ch = (char)c.read();
+        bytes++;
+        if (firstLine.length() < 40 && ch != '\r' && ch != '\n') firstLine += ch;
+        deadline = millis() + 3000;
+      }
+      delay(10);
+    }
+    c.stop();
+    Serial.printf("reply: \"%s\"  %lu bytes in %lu ms\r\n",
+                  firstLine.c_str(), (unsigned long)bytes,
+                  (unsigned long)(millis() - t0));
+    return;
+  }
+
   if (!strcmp(line, "scan")) {
     /* Optional dwell time per channel in ms; EU duty cycling can space beacons out. */
     uint32_t dwell = (uint32_t)atol(arg);
@@ -253,13 +317,21 @@ static void execute(char *line) {
       if (st == MMWLAN_SUCCESS)
         Serial.printf("  %02X:%02X:%02X:%02X:%02X:%02X", b[0],b[1],b[2],b[3],b[4],b[5]);
       Serial.println();
-      Serial.printf("AP isEnabled     : %d  chan %u  opclass %u\r\n",
-                    (int)HaLow.HalowAPClass::isEnabled(),
-                    HaLow.HalowAPClass::getChannel(), HaLow.HalowAPClass::getOpClass());
+      /*
+       * Not HaLow.HalowAPClass::isEnabled()/getChannel(): those track the
+       * wrapper's own ap_args, which we bypass, so they read 0 and mislead.
+       */
+      ChannelInfo ci;
+      if (halowChannelByNumber(g_cfg.region, g_cfg.channel, ci)) {
+        Serial.printf("AP config        : chan %u  opclass %u  bw %u MHz  beacon %u TU\r\n",
+                      ci.chanNum, (unsigned)ci.globalOpClass, ci.bwMhz,
+                      halowBeaconIntervalTus());
+      }
     } else {
       Serial.printf("mmwlan sta state : %d (0=DISABLED 1=CONNECTING 2=CONNECTED)\r\n",
                     (int)mmwlan_get_sta_state());
       Serial.printf("get_bssid        : %d\r\n", (int)mmwlan_get_bssid(b));
+      Serial.printf("scan dwell       : %lu ms\r\n", (unsigned long)halowScanDwellMs());
     }
 
     uint8_t m[6] = {0};

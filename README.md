@@ -384,6 +384,27 @@ Give both nodes ~15 s. The header pill should read **LINK UP**, and the
 * **Logs** — boot, HC01 init, MM6108/BCF versions, association, disconnects,
   errors, test start/stop. Downloadable, clearable, mirrored to Serial @115200.
 
+### Reaching both panels
+
+Each node runs its **own, independent** management Wi‑Fi, so both legitimately
+use `192.168.4.1` — they are separate networks and never meet, exactly like two
+home routers both being `192.168.1.1`. You tell them apart by SSID.
+
+Each node also serves the same panel on its **HaLow** address, and NAPT is
+enabled on the management AP, so from one node's Wi‑Fi you can open the other
+node's full panel:
+
+| Connected to | Local panel | Remote node's panel |
+|---|---|---|
+| `HaLow-Tester-XXXX` (AP node) | http://192.168.4.1/ | http://192.168.50.2/ |
+| `HaLow-Tester-YYYY` (STA node) | http://192.168.4.1/ | http://192.168.50.1/ |
+
+Verified device-to-device over the HaLow link (`HTTP/1.1 200 OK`, ~2.4 KB, in
+0.8 s AP→STA and 3.6 s STA→AP — slow because of the duty cycle, but working).
+The phone-to-remote-panel path uses the same route plus NAPT; the NAPT hop
+itself has not been exercised from a real Wi‑Fi client here, as this
+development machine has no Wi‑Fi adapter.
+
 Live updates arrive by **Server‑Sent Events on port 81**. The bundled
 `WebServer` class is synchronous and cannot hold a streaming response open, so
 SSE runs on its own small socket server; the page falls back to polling
@@ -403,7 +424,14 @@ ssid <s>  pass <s>     ip|mask|gw|peer <a>  txpower <dBm>
 beacon <TU>            save  reboot  factory
 status   cfg   chans   state   scan [ms]
 ping on|off [ms]       test tcp|udp tx|rx [s] [kbps]   stop
+json [history]         httpget [ip]
 ```
+
+`json` prints the exact document the web panel consumes, so the API can be
+validated without a Wi‑Fi client attached — that is how the field population of
+every dashboard value was verified here. `httpget [ip]` fetches `/api/status`
+from the peer over HaLow, which distinguishes "the panel is broken" from "the
+link is down".
 
 `state` and `scan` are diagnostics: `state` dumps the raw driver view (AP BSSID,
 `mmwlan_get_sta_state()`, duty cycle), and `scan [dwell_ms]` runs a HaLow scan
