@@ -47,7 +47,8 @@ static void printHelp(void) {
     "  i2cscan [sda scl]          hunt for an I2C display on an add-on board\r\n"
     "  btnscan [s]                identify button GPIOs on an add-on board\r\n"
     "  probe                      query the metric sources the headers leave unclear\r\n"
-    "  noise                      scan for noise floor / SNR (keeps the link up)\r\n"));
+    "  noise                      scan for noise floor / SNR (keeps the link up)\r\n"
+    "  rttreset                   clear RTT stats and start a fresh window\r\n"));
 }
 
 static void printCfg(void) {
@@ -727,6 +728,17 @@ static void execute(char *line) {
    * do not. This runs a raw scan (not HaLow.scanNetworks(), whose wrapper drops
    * the field) to find out whether the chip actually fills it in.
    */
+  /*
+   * RTT statistics run cumulatively from boot, so after carrying a node around
+   * they still carry the loss from wherever it was out of range. This drops the
+   * history and starts a clean window at the current position.
+   */
+  if (!strcmp(line, "rttreset")) {
+    rttResetStats();
+    Serial.println(F("RTT statistics cleared"));
+    return;
+  }
+
   if (!strcmp(line, "noise")) {
     struct mmwlan_scan_req req = MMWLAN_SCAN_REQ_INIT;
     req.args.dwell_time_ms    = halowScanDwellMs();
