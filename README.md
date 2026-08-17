@@ -97,10 +97,9 @@ This was the central research question, and the answer is enforced in the code:
 
 | Metric | Why |
 |---|---|
-| **SNR** | No live noise measurement exists in the connected state, so SNR cannot be computed. |
-| **Noise floor** | `noise_dbm` exists **only** in `mmwlan_scan_result`, i.e. during a scan — not while associated. |
+| **SNR / noise floor, continuously** | Neither is in any connected-state API. They are obtainable **on demand** via a scan — see the note below — but not as a once-per-second sample alongside RSSI. |
 | **Actual TX power** | The API has no "read current TX power". Only `mmwlan_override_max_tx_power()` (write), and it can only *lower* the regulatory ceiling, never raise it. The panel therefore shows the **configured ceiling** (your override, or the channel's regulatory max), explicitly labelled. |
-| **TX/RX packet & byte counters** | `mmipal_get_link_packet_counts()` exists, but it requires `LWIP_STATS`, which **is not defined** in this platform's `halow_config.h`. It would silently return 0, so it is not used. |
+| **TX/RX packet & byte counters** | `mmipal_get_link_packet_counts()` requires `LWIP_STATS`, which is **not** defined (`lwipopts.h` sets it from `CONFIG_LWIP_STATS`, absent from the prebuilt `sdkconfig.h`), so it would silently return 0. `struct mmwlan_stats_umac_data` has only *drop* counters, no totals. The chip does hold counters — see the `probe` note below — but they are unlabelled. |
 | **Retry count** | Only per‑rate attempts vs successes are exposed, not a raw retry counter. PER is reported instead. |
 | **Disconnect reason code** | The Arduino event layer delivers `ARDUINO_HALOW_EVENT_STA_DISCONNECTED` with no reason field. |
 | **Channel utilisation** | Not exposed by the API. (Duty‑cycle stats are reported, which is a different quantity.) |
@@ -108,6 +107,66 @@ This was the central research question, and the answer is enforced in the code:
 | **TCP retransmissions** | Not in `mmiperf_report`. |
 | **Beacon interval / capability / TSF** | Present in scan results only, not while associated. |
 | **Simultaneous bidirectional UDP** | `mmiperf` has no dual‑test mode. |
+
+#### Noise floor and SNR: obtainable, but only as a snapshot
+
+`struct mmwlan_scan_result` carries a `noise_dbm` field — "background noise
+measured by the chip on the channel at the time the probe response was
+received". Nothing equivalent exists once associated, and `HaLow.scanNetworks()`
+drops the field, so it has to be read from a raw `mmwlan_scan_request()`.
+
+The serial command `noise` does exactly that. Setting `dwell_on_home_ms` makes
+the chip return to the home channel between channels, so **the link survives the
+scan** — measured across repeated scans, uptime kept climbing and the disconnect
+counter stayed at 0.
+
+What it actually costs, measured on the bench at ~1 m separation:
+
+```
+rssi  -34 dBm   noise  -94 dBm   snr  60 dB
+rssi  -31 dBm   noise  -56 dBm   snr  25 dB
+(third scan returned no result at all)
+```
+
+Three things to take from that, and they are the reason this is **not** wired
+into the once-per-second sampler:
+
+1. The spread is large. `noise_dbm` is a single instantaneous reading taken at
+   the moment one probe response lands, not an averaged noise floor. The −56 dBm
+   sample almost certainly caught the channel while something was transmitting.
+2. A scan can come back empty. At 1 MHz with a 307 ms beacon there is no
+   guarantee a probe response arrives inside the dwell window.
+3. It disturbs the measurement it is meant to describe. Across the two scans
+   above the rate controller dropped from MCS7 to MCS6.
+
+So it belongs as an explicit on-demand action, and any value shown must be
+labelled as a snapshot rather than presented next to RSSI as if it were an
+equally solid reading.
+
+#### `mmwlan_get_morse_stats()`: real counters, no published names
+
+The API documents one further escape hatch: a binary blob "that can be parsed by
+host tools". The serial command `probe` dumps it. It decodes cleanly as a packed
+TLV stream — 16-bit little-endian id, 16-bit little-endian length, value
+immediately after with no alignment padding — and the parser consumes all
+1030 bytes of core 0 and all 1471 bytes of core 1 exactly, yielding 94 and 163
+entries.
+
+The counters are real and they move with traffic. Deltas across one 12 s UDP
+test (83 frames, 121 180 bytes):
+
+```
+2003: 60 -> 118      2004: 59 -> 117      (an attempted/succeeded-shaped pair)
+1020: 98 -> 380      1021: 98 -> 379
+2010: 30167 -> 30162 (goes down: a gauge, not a counter)
+```
+
+Morse publishes no id-to-name mapping, and the header explicitly says the blob
+is for host tools. Labelling `2003` as "TX packets" because it looks like one
+would be exactly the invented metric this project refuses to ship. Identifying
+an id properly means correlating it against controlled traffic across many
+runs — worth doing, but until then `probe` reports raw ids and nothing claims to
+know what they mean.
 
 ---
 
@@ -480,6 +539,7 @@ beacon <TU>            save  reboot  factory
 status   cfg   chans   state   scan [ms]
 ping on|off [ms]       test tcp|udp tx|rx [s] [kbps]   stop
 json [history]         httpget [ip]
+noise                  probe
 ```
 
 `json` prints the exact document the web panel consumes, so the API can be
@@ -492,6 +552,12 @@ link is down".
 `mmwlan_get_sta_state()`, duty cycle), and `scan [dwell_ms]` runs a HaLow scan
 and lists what the radio can actually hear — the fastest way to tell "the AP is
 not transmitting" from "the STA cannot associate".
+
+`noise` and `probe` exist to keep §3's availability claims honest. `noise` runs a
+raw `mmwlan_scan_request()` and prints RSSI, noise floor and derived SNR without
+dropping the link; `probe` queries duty-cycle statistics, `mmwlan_ap_get_sta_status()`
+and the `mmwlan_get_morse_stats()` TLV blob. Anything §3 lists as unavailable
+should be re-checkable with these two commands rather than taken on trust.
 
 ---
 

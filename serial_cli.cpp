@@ -45,7 +45,9 @@ static void printHelp(void) {
     "  httpget [ip]               fetch /api/status from the peer over HaLow\r\n"
     "  scan [ms]                  HaLow scan (dwell per channel)\r\n"
     "  i2cscan [sda scl]          hunt for an I2C display on an add-on board\r\n"
-    "  btnscan [s]                identify button GPIOs on an add-on board\r\n"));
+    "  btnscan [s]                identify button GPIOs on an add-on board\r\n"
+    "  probe                      query the metric sources the headers leave unclear\r\n"
+    "  noise                      scan for noise floor / SNR (keeps the link up)\r\n"));
 }
 
 static void printCfg(void) {
@@ -717,6 +719,115 @@ static void execute(char *line) {
                     HaLow.BSSIDstr(i).c_str(), HaLow.encryptionTypeStr(i).c_str());
     }
     HaLow.scanDelete();
+    return;
+  }
+
+  /*
+   * mmwlan_scan_result carries a noise_dbm field that the associated-state APIs
+   * do not. This runs a raw scan (not HaLow.scanNetworks(), whose wrapper drops
+   * the field) to find out whether the chip actually fills it in.
+   */
+  if (!strcmp(line, "noise")) {
+    struct mmwlan_scan_req req = MMWLAN_SCAN_REQ_INIT;
+    req.args.dwell_time_ms    = halowScanDwellMs();
+    req.args.dwell_on_home_ms = 100; /* keep servicing the link between channels */
+    req.scan_rx_cb = [](const struct mmwlan_scan_result *r, void *) {
+      char ssid[33];
+      size_t n = r->ssid_len < 32 ? r->ssid_len : 32;
+      memcpy(ssid, r->ssid, n);
+      ssid[n] = '\0';
+      Serial.printf("  %-16s %9lu Hz  bw %u  rssi %4d dBm  noise %4d dBm  snr %4d dB\r\n",
+                    ssid, (unsigned long)r->channel_freq_hz, r->bw_mhz,
+                    (int)r->rssi, (int)r->noise_dbm, (int)(r->rssi - r->noise_dbm));
+    };
+    req.scan_complete_cb = [](enum mmwlan_scan_state state, void *) {
+      Serial.printf("scan complete, state %d\r\n", (int)state);
+    };
+    Serial.printf("scanning (dwell %lu ms, home %lu ms)...\r\n",
+                  (unsigned long)req.args.dwell_time_ms,
+                  (unsigned long)req.args.dwell_on_home_ms);
+    enum mmwlan_status st = mmwlan_scan_request(&req);
+    if (st != MMWLAN_SUCCESS) Serial.printf("scan request failed: %d\r\n", (int)st);
+    return;
+  }
+
+  /*
+   * Empirical check of the metric sources the headers leave ambiguous, so the
+   * "not available" claims in the README rest on measurement rather than on a
+   * reading of the doc comments.
+   */
+  if (!strcmp(line, "probe")) {
+    struct mmwlan_duty_cycle_stats dc;
+    memset(&dc, 0, sizeof(dc));
+    enum mmwlan_status st = mmwlan_get_duty_cycle_stats(&dc);
+    Serial.printf("duty_cycle_stats : rc=%d  target=%lu (%.2f%%)  mode=%d  "
+                  "burst_remaining=%lu us  burst_window=%lu us\r\n",
+                  (int)st, (unsigned long)dc.duty_cycle, dc.duty_cycle / 100.0f,
+                  (int)dc.mode, (unsigned long)dc.burst_airtime_remaining_us,
+                  (unsigned long)dc.burst_window_duration_us);
+
+    if (g_cfg.role == ROLE_AP) {
+      /* Does the AP expose anything per-STA beyond state/aid/mac? */
+      struct mmwlan_ap_sta_status ss;
+      memset(&ss, 0, sizeof(ss));
+      /* The STA's own MAC reaches us over the telemetry link, not from mmwlan. */
+      const PeerInfo &pi = peerData();
+      unsigned m[6];
+      if (pi.valid &&
+          sscanf(pi.mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+                 &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+        uint8_t peer[6];
+        for (int i = 0; i < 6; i++) peer[i] = (uint8_t)m[i];
+        st = mmwlan_ap_get_sta_status(peer, &ss);
+        Serial.printf("ap_sta_status    : rc=%d  state=%d  aid=%u  mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                      (int)st, (int)ss.state, (unsigned)ss.aid,
+                      ss.mac_addr[0], ss.mac_addr[1], ss.mac_addr[2],
+                      ss.mac_addr[3], ss.mac_addr[4], ss.mac_addr[5]);
+        Serial.printf("                   sizeof(struct)=%u B - no RSSI/counter field exists\r\n",
+                      (unsigned)sizeof(ss));
+      } else {
+        Serial.println(F("ap_sta_status    : peer MAC unknown yet"));
+      }
+    } else {
+      Serial.println(F("ap_sta_status    : AP role only"));
+    }
+
+    /*
+     * The one documented "binary blob parsed by host tools" escape hatch. The
+     * blob turns out to be a packed TLV stream: id and length are 16-bit
+     * little-endian, the value follows immediately with no alignment padding.
+     * Morse publishes no field names, so this prints raw ids - meaning has to
+     * come from correlating a counter against known traffic, never from a
+     * guess at what an id might stand for.
+     */
+    for (uint32_t core = 0; core < 2; core++) {
+      struct mmwlan_morse_stats *ms = mmwlan_get_morse_stats(core, false);
+      if (!ms) {
+        Serial.printf("morse_stats co%lu : NULL\r\n", (unsigned long)core);
+        continue;
+      }
+      Serial.printf("morse_stats co%lu : %lu bytes\r\n",
+                    (unsigned long)core, (unsigned long)ms->len);
+      uint32_t off = 0, count = 0;
+      while (off + 4 <= ms->len) {
+        uint16_t id  = (uint16_t)(ms->buf[off]     | (ms->buf[off + 1] << 8));
+        uint16_t len = (uint16_t)(ms->buf[off + 2] | (ms->buf[off + 3] << 8));
+        off += 4;
+        if (id == 0 || off + len > ms->len) break;
+        if (len == 4) {
+          uint32_t v = (uint32_t)ms->buf[off] | ((uint32_t)ms->buf[off + 1] << 8) |
+                       ((uint32_t)ms->buf[off + 2] << 16) | ((uint32_t)ms->buf[off + 3] << 24);
+          if (v) Serial.printf("  %04X = %lu\r\n", id, (unsigned long)v);
+        } else {
+          Serial.printf("  %04X [%u B]\r\n", id, (unsigned)len);
+        }
+        off += len;
+        count++;
+      }
+      Serial.printf("  -- %lu TLVs, %lu bytes consumed (nonzero u32 shown)\r\n",
+                    (unsigned long)count, (unsigned long)off);
+      mmwlan_free_morse_stats(ms);
+    }
     return;
   }
 
